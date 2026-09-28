@@ -1,5 +1,6 @@
 ﻿Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -TypeDefinition @'
 using System;
 using System.Drawing;
@@ -408,14 +409,60 @@ function Refresh-Presets {$presetList.Items.Clear();foreach($f in Get-ChildItem 
 $presetSave.Add_Click({$name=($script:presetName.Text -replace '[^a-zA-Z0-9 _-]','').Trim();if(!$name){[System.Windows.Forms.MessageBox]::Show('Enter a preset name first.','TapForge');return};$data=@{intervalMs=(Get-IntervalMilliseconds);interval=[int]$interval.Value;intervalUnit=$intervalUnit.SelectedIndex;button=$buttonPick.SelectedIndex;stopMode=$modePick.SelectedIndex;limit=[long]$limit.Value;speedMode=$speedMode.SelectedIndex;rate=[int]$rate.Value;extended=$script:extendedSpeed.Checked;hotkey=$keyPick.SelectedItem.ToString();hotkeyMode=$hotkeyMode.SelectedIndex;keyboard=$keyboardMode.Checked;keyCode=$keyCodePick.SelectedIndex;double=$doubleClick.Checked;duty=[int]$duty.Value;random=[int]$randomize.Value;corners=$cornerStop.Checked;cornerSize=[int]$cornerSize.Value;edges=$edgeStop.Checked;edgeSize=[int]$edgeSize.Value};$data|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $script:presetDirectory ($name+'.json')) -Encoding UTF8;Refresh-Presets})
 $presetLoad.Add_Click({if($presetList.SelectedItem){$d=Get-Content -LiteralPath (Join-Path $script:presetDirectory ($presetList.SelectedItem+'.json')) -Raw|ConvertFrom-Json;$script:extendedSpeed.Checked=[bool]$d.extended;if($d.PSObject.Properties['intervalMs']){$intervalUnit.SelectedIndex=if($d.PSObject.Properties['intervalUnit']){[int]$d.intervalUnit}else{0};Set-IntervalMilliseconds ([long]$d.intervalMs)}else{$intervalUnit.SelectedIndex=0;$SetOldInterval=[decimal]$d.interval;$interval.Value=[Math]::Min($interval.Maximum,[Math]::Max($interval.Minimum,$SetOldInterval))};$buttonPick.SelectedIndex=[int]$d.button;$modePick.SelectedIndex=[int]$d.stopMode;$limit.Value=[decimal]$d.limit;$speedMode.SelectedIndex=[int]$d.speedMode;$rate.Value=[decimal]$d.rate;$keyPick.SelectedItem=[string]$d.hotkey;$hotkeyMode.SelectedIndex=[int]$d.hotkeyMode;$keyboardMode.Checked=[bool]$d.keyboard;$keyCodePick.SelectedIndex=[int]$d.keyCode;$doubleClick.Checked=[bool]$d.double;$duty.Value=[decimal]$d.duty;$randomize.Value=[decimal]$d.random;$cornerStop.Checked=[bool]$d.corners;$cornerSize.Value=[decimal]$d.cornerSize;$edgeStop.Checked=[bool]$d.edges;$edgeSize.Value=[decimal]$d.edgeSize}})
 $presetDelete.Add_Click({if($presetList.SelectedItem){Remove-Item -LiteralPath (Join-Path $script:presetDirectory ($presetList.SelectedItem+'.json')) -Force;Refresh-Presets}});Refresh-Presets
-$maintenanceCard=New-Card 0 0 830 340;$maintenancePage.Controls.Add($maintenanceCard)
+$maintenanceCard=New-Card 0 0 830 390;$maintenancePage.Controls.Add($maintenanceCard)
 $maintenanceCard.Controls.Add((New-Label 'Maintenance' 20 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$maintenanceCard.Controls.Add((New-Label 'Manage app settings and local diagnostic files.' 20 50 700 24 9 $script:colorMuted))
+$maintenanceCard.Controls.Add((New-Label 'Manage settings, diagnostics, and TapForge updates.' 20 50 700 24 9 $script:colorMuted))
 $resetSettings=New-Button 'Reset all settings' 20 104 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$openDiagnostics=New-Button 'Open diagnostics folder' 220 104 200 38 $script:colorAccent ([System.Drawing.Color]::White);$exportDiagnostics=New-Button 'Export diagnostics' 440 104 180 38 $script:colorAccent ([System.Drawing.Color]::White);$resetUsage=New-Button 'Reset usage data' 20 160 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$maintenanceCard.Controls.AddRange(@($resetSettings,$openDiagnostics,$exportDiagnostics,$resetUsage))
+$script:checkUpdateButton=New-Button 'Check for updates' 220 160 180 38 $script:colorAccent ([System.Drawing.Color]::White);$maintenanceCard.Controls.Add($script:checkUpdateButton)
+$script:publishUpdateButton=New-Button 'Publish update' 420 160 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$script:publishUpdateButton.Visible=(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Publish-TapForgeUpdate.ps1'));$maintenanceCard.Controls.Add($script:publishUpdateButton)
+$script:updateStatus=New-Label 'Current version: loading…' 20 218 720 24 9 $script:colorMuted;$maintenanceCard.Controls.Add($script:updateStatus)
+$script:versionFile=Join-Path $PSScriptRoot 'VERSION';$script:appVersion='3.9.6';if(Test-Path -LiteralPath $script:versionFile){try{$script:appVersion=(Get-Content -LiteralPath $script:versionFile -Raw).Trim()}catch{}}
+$script:updateStatus.Text="Current version: $($script:appVersion)"
 $script:diagnosticsDirectory=Join-Path $env:LOCALAPPDATA 'TapForge\Diagnostics';[void](New-Item -ItemType Directory -Force -Path $script:diagnosticsDirectory)
 $openDiagnostics.Add_Click({Start-Process explorer.exe -ArgumentList ('"'+$script:diagnosticsDirectory+'"')})
 $exportDiagnostics.Add_Click({$dlg=[System.Windows.Forms.SaveFileDialog]::new();$dlg.Filter='JSON report|*.json';$dlg.FileName='TapForge-diagnostics.json';if($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK){@{app='TapForge';created=(Get-Date).ToString('o');windows=[Environment]::OSVersion.Version.ToString();powershell=$PSVersionTable.PSVersion.ToString();clicks=$script:clickCount;clickEngine='Native high-resolution worker'}|ConvertTo-Json|Set-Content -LiteralPath $dlg.FileName -Encoding UTF8};$dlg.Dispose()})
 $resetUsage.Add_Click({$script:clickCount=0;$countLabel.Text='0';$script:stopwatch.Reset();$elapsedLabel.Text='00:00:00'})
+function Get-TapForgeLatestRelease {
+    [System.Net.ServicePointManager]::SecurityProtocol=[System.Net.SecurityProtocolType]::Tls12
+    $request=[System.Net.HttpWebRequest]::Create('https://api.github.com/repos/saberapexyt-commits/TapForge/releases/latest')
+    $request.Method='GET';$request.UserAgent='TapForge-Updater';$request.Accept='application/vnd.github+json';$request.Timeout=7000;$request.ReadWriteTimeout=7000
+    $response=$null;$reader=$null
+    try{$response=$request.GetResponse();$reader=[System.IO.StreamReader]::new($response.GetResponseStream());$json=$reader.ReadToEnd();ConvertFrom-Json -InputObject $json}
+    finally{if($reader){$reader.Dispose()};if($response){$response.Dispose()}}
+}
+function Install-TapForgeRelease($release) {
+    $tag=[string]$release.tag_name;$assetName="TapForge-$tag-Portable.zip";$asset=@($release.assets|Where-Object{$_.name -eq $assetName}|Select-Object -First 1)
+    if(!$tag -or !$asset){[System.Windows.Forms.MessageBox]::Show("The $tag release does not contain its portable app ZIP.",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)|Out-Null;return}
+    $target=$PSScriptRoot;$updates=Join-Path $env:LOCALAPPDATA 'TapForge\Updates';$stage=Join-Path $updates ([guid]::NewGuid().ToString('N'));$zip=Join-Path $updates $assetName
+    try{
+        [void](New-Item -ItemType Directory -Force -Path $stage)
+        $request=[System.Net.HttpWebRequest]::Create([string]$asset.browser_download_url);$request.Method='GET';$request.UserAgent='TapForge-Updater';$request.Timeout=30000;$request.ReadWriteTimeout=30000
+        $response=$request.GetResponse();try{$inputStream=$response.GetResponseStream();$file=[System.IO.File]::Open($zip,[System.IO.FileMode]::Create,[System.IO.FileAccess]::Write);try{$inputStream.CopyTo($file)}finally{$file.Dispose();$inputStream.Dispose()}}finally{$response.Dispose()}
+        if($asset.digest -and ([string]$asset.digest -match '^sha256:([0-9a-fA-F]{64})$')){$expected=$Matches[1];$actual=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash;if($actual -ne $expected){throw 'The downloaded update did not pass its SHA-256 check.'}}
+        Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+        foreach($required in @('TapForge.exe','AutoClicker.ps1','TapForge.ico','TapForgeLogo.png','VERSION')){if(!(Test-Path -LiteralPath (Join-Path $stage $required))){throw "The update package is missing $required."}}
+        $probe=Join-Path $target '.tapforge-update-check';Set-Content -LiteralPath $probe -Value 'ok' -Encoding ascii;Remove-Item -LiteralPath $probe -Force
+        $helper=Join-Path $updates 'Apply-TapForgeUpdate.ps1'
+        @'
+param([string]$TargetDir,[string]$StageDir,[int]$WaitPid)
+$ErrorActionPreference='Stop'
+for($i=0;$i -lt 120;$i++){if(!(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}
+if(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue){exit 2}
+foreach($name in @('TapForge.exe','AutoClicker.ps1','TapForge.ico','TapForgeLogo.png','VERSION','README.txt','Launch AutoClicker.bat')){$from=Join-Path $StageDir $name;if(Test-Path -LiteralPath $from){Copy-Item -LiteralPath $from -Destination (Join-Path $TargetDir $name) -Force}}
+Start-Process -FilePath (Join-Path $TargetDir 'TapForge.exe') -WorkingDirectory $TargetDir
+'@ | Set-Content -LiteralPath $helper -Encoding UTF8
+        $args="-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$helper`" -TargetDir `"$target`" -StageDir `"$stage`" -WaitPid $PID"
+        Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $args -WindowStyle Hidden
+        $script:exitRequested=$true;$form.Close()
+    }catch{[System.Windows.Forms.MessageBox]::Show("TapForge could not install the update.`r`n`r`n$($_.Exception.Message)",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)|Out-Null;if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue}}
+}
+$script:updateWorker=[System.ComponentModel.BackgroundWorker]::new();$script:updateWorker.WorkerSupportsCancellation=$false
+$script:updateWorker.Add_DoWork({param($sender,$e)try{$e.Result=@{Release=(Get-TapForgeLatestRelease);Automatic=[bool]$e.Argument;Error=$null}}catch{$e.Result=@{Release=$null;Automatic=[bool]$e.Argument;Error=$_.Exception.Message}}})
+$script:updateWorker.Add_RunWorkerCompleted({param($sender,$e)$result=$e.Result;if($e.Error){$script:updateStatus.Text='Could not check for updates.';if(!$script:updateCheckAutomatic){[System.Windows.Forms.MessageBox]::Show("Could not check for updates.`r`n`r`n$($e.Error.Message)",'TapForge update')|Out-Null};return};if($result.Error){$script:updateStatus.Text='Could not check for updates.';if(!$result.Automatic){[System.Windows.Forms.MessageBox]::Show("Could not check for updates.`r`n`r`n$($result.Error)",'TapForge update')|Out-Null};return};$release=$result.Release;$available=try{([version]([string]$release.tag_name -replace '^v','')) -gt ([version]$script:appVersion)}catch{$false};if(!$available){$script:updateStatus.Text="You're up to date (v$($script:appVersion)).";if(!$result.Automatic){[System.Windows.Forms.MessageBox]::Show("TapForge v$($script:appVersion) is up to date.",'TapForge update')|Out-Null};return};$script:updateStatus.Text="Update available: $($release.tag_name)";$choice=[System.Windows.Forms.MessageBox]::Show("TapForge $($release.tag_name) is available. Download and install it now?`r`n`r`nTapForge will close and reopen after the update.",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Information);if($choice -eq [System.Windows.Forms.DialogResult]::Yes){Install-TapForgeRelease $release}})
+$script:updateCheckAutomatic=$false
+$script:checkForTapForgeUpdate={param([bool]$automatic=$false)if($script:updateWorker.IsBusy){return};$script:updateCheckAutomatic=$automatic;$script:updateStatus.Text='Checking for updates…';$script:updateWorker.RunWorkerAsync($automatic)}
+$script:checkUpdateButton.Add_Click({& $script:checkForTapForgeUpdate $false})
+$script:publishUpdateButton.Add_Click({$v=[version]$script:appVersion;$next="$($v.Major).$($v.Minor).$($v.Build+1)";$answer=[Microsoft.VisualBasic.Interaction]::InputBox('Enter the version to publish (for example, '+$next+').','Publish TapForge update',$next);if(!$answer){return};if($answer -notmatch '^\d+\.\d+\.\d+$'){[System.Windows.Forms.MessageBox]::Show('Use a version in major.minor.patch format.','Publish TapForge update')|Out-Null;return};$publisher=Join-Path $PSScriptRoot 'Publish-TapForgeUpdate.ps1';$args="-NoProfile -ExecutionPolicy Bypass -File `"$publisher`" -Version `"$answer`"";Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $args -WorkingDirectory $PSScriptRoot})
 $resetSettings.Add_Click({if([System.Windows.Forms.MessageBox]::Show('Reset TapForge settings to their defaults?','TapForge',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question) -eq [System.Windows.Forms.DialogResult]::Yes){$themePick.SelectedIndex=0;$appearanceModePick.SelectedIndex=0;$script:globalAccent=[System.Drawing.Color]::FromArgb(123,97,255);foreach($k in $script:pageAccents.Keys){$script:pageAccents[$k]=$script:globalAccent};$intervalUnit.SelectedIndex=0;Set-IntervalMilliseconds 100;$buttonPick.SelectedIndex=0;$modePick.SelectedIndex=0;$limit.Value=100;$speedMode.SelectedIndex=0;$rate.Value=10;$keyPick.SelectedIndex=0;$hotkeyMode.SelectedIndex=0;$keyboardMode.Checked=$false;$doubleClick.Checked=$false;$duty.Value=0;$randomize.Value=0;$cornerStop.Checked=$false;$edgeStop.Checked=$false;$script:alwaysTop.Checked=$false;$script:stopAlert.Checked=$true;$script:strictHotkey.Checked=$false;$script:stopAltTab.Checked=$false;$script:extendedSpeed.Checked=$false;$script:minimizeTray.Checked=$false;$script:rememberPosition.Checked=$true;$script:runOnStartup.Checked=$false;$script:pointDefaultClicks.Value=1;$script:pointDefaultRadius.Value=0;$script:pointsEnabled.Checked=$false;$script:stopWhenPointsDone.Checked=$false;$script:points.Clear();$pointList.Items.Clear();Apply-Theme}})
 $script:globalAccent=$script:colorAccent;$script:pageAccents=@{Clicking=$script:colorAccent;Behavior=$script:colorAccent;Appearance=$script:colorAccent;'Click Points'=$script:colorAccent;Keybinds=$script:colorAccent;'Process List'=$script:colorAccent;Presets=$script:colorAccent;Maintenance=$script:colorAccent};$script:appearanceMode='Global';$script:lightTheme=$false;$script:panelOpacity=100
 $appearanceCard=New-Card 0 0 830 490; $appearanceCard.Location=[System.Drawing.Point]::new(0,0);$appearancePage.Controls.Add($appearanceCard)
@@ -646,6 +693,7 @@ $hotkeyTimer.Add_Tick({
 })
 $hotkeyTimer.Start()
 $global:TapForgeReady=$true
+& $script:checkForTapForgeUpdate $true
 [void]$form.ShowDialog()
 $hotkeyTimer.Stop(); $hotkeyTimer.Dispose()
 $script:brandImage.Dispose();$script:logoSourceImage.Dispose();$script:logoIcon.Dispose()

@@ -17,7 +17,7 @@ jobs:
 
       - name: Build TapForge
         shell: powershell
-        run: .\Build TapForge.ps1
+        run: '& .\Build TapForge.ps1'
 
       - name: Package portable app
         shell: powershell
@@ -26,7 +26,7 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           $stage = Join-Path $env:RUNNER_TEMP 'TapForge-Portable'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item TapForge.exe, AutoClicker.ps1, TapForge.ico, TapForgeLogo.png, 'Launch AutoClicker.bat', README.txt -Destination $stage
+          Copy-Item TapForge.exe, AutoClicker.ps1, TapForge.ico, TapForgeLogo.png, VERSION, 'Launch AutoClicker.bat', README.txt -Destination $stage
           $archive = "TapForge-$tag-Portable.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

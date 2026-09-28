@@ -33,4 +33,8 @@ The script pushes the source to `main`, creates a matching `v3.9.7` tag, and
 pushes that tag. GitHub Actions then builds and publishes
 `TapForge-v3.9.7-Portable.zip`.
 
-The app's in-app update check and install flow are a separate client-side change.
+TapForge checks the public releases feed when it opens and offers to download
+and install a newer release. The development copy also has a **Publish update**
+button on its Maintenance page; the portable package hides that publisher
+button. A friend using an older package must install this update-enabled build
+once before future releases can be installed from inside the app.
