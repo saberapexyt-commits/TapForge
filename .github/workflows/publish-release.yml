@@ -1,0 +1,52 @@
+name: Build and publish TapForge release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Build TapForge
+        shell: powershell
+        run: .\Build TapForge.ps1
+
+      - name: Package portable app
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $stage = Join-Path $env:RUNNER_TEMP 'TapForge-Portable'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item TapForge.exe, AutoClicker.ps1, TapForge.ico, TapForgeLogo.png, 'Launch AutoClicker.bat', README.txt -Destination $stage
+          $archive = "TapForge-$tag-Portable.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
+          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish release and portable download
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $release = Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases" -Headers $headers -ContentType 'application/json' -Body (@{
+            tag_name = $env:GITHUB_REF_NAME
+            name = "TapForge $env:GITHUB_REF_NAME"
+            generate_release_notes = $true
+          } | ConvertTo-Json)
+          $asset = "TapForge-$env:GITHUB_REF_NAME-Portable.zip"
+          $uploadUri = ($release.upload_url -replace '\{\?name,label\}$', '') + '?name=' + [uri]::EscapeDataString($asset)
+          Invoke-RestMethod -Method Post -Uri $uploadUri -Headers $headers -ContentType 'application/zip' -InFile $asset | Out-Null

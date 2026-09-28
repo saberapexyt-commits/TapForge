@@ -1,0 +1,9 @@
+# Generated executables and friend distribution bundles
+/TapForge.exe
+/TapForge.lnk
+/forfriends/
+/release/
+
+# Local developer settings
+.vs/
+*.user
