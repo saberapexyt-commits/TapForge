@@ -7,3 +7,6 @@
 # Local developer settings
 .vs/
 *.user
+
+# Developer-only marker (makes the local TapForge.exe use the loose script)
+/TapForge.dev

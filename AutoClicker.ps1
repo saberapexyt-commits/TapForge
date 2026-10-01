@@ -1,7 +1,5 @@
-﻿Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName Microsoft.VisualBasic
-Add-Type -TypeDefinition @'
+﻿# TapForge 4 - generated from source parts. Edit the parts, not this header.
+$engineSource = @'
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -10,14 +8,6 @@ using System.Windows.Forms;
 using System.Diagnostics;
 using System.Threading;
 using System.Runtime.InteropServices;
-public class TapForgeWindow : System.Windows.Forms.Form {
-    const int WM_NCHITTEST=0x84;
-    [DllImport("user32.dll")] static extern bool ReleaseCapture();
-    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd,int msg,IntPtr wParam,IntPtr lParam);
-    public static void BeginDrag(IntPtr hwnd){ReleaseCapture();SendMessage(hwnd,0xA1,new IntPtr(2),IntPtr.Zero);}
-    protected override CreateParams CreateParams { get { CreateParams cp=base.CreateParams;cp.Style|=0x00040000;return cp; } }
-    protected override void WndProc(ref Message m){if(m.Msg==WM_NCHITTEST&&WindowState==FormWindowState.Normal){Point p=PointToClient(Cursor.Position);int b=7;bool l=p.X<b,r=p.X>=ClientSize.Width-b,t=p.Y<b,bt=p.Y>=ClientSize.Height-b;if(t&&l)m.Result=(IntPtr)13;else if(t&&r)m.Result=(IntPtr)14;else if(bt&&l)m.Result=(IntPtr)16;else if(bt&&r)m.Result=(IntPtr)17;else if(l)m.Result=(IntPtr)10;else if(r)m.Result=(IntPtr)11;else if(t)m.Result=(IntPtr)12;else if(bt)m.Result=(IntPtr)15;else base.WndProc(ref m);return;}base.WndProc(ref m);}
-}
 public static class ClickNative {
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
@@ -47,6 +37,32 @@ public static class ClickNative {
     [DllImport("user32.dll")] static extern void keybd_event(byte vk,byte scan,uint flags,UIntPtr extra);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint processId);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateWaitableTimerExW(IntPtr attributes,string name,uint flags,uint access);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetWaitableTimer(IntPtr timer,ref long dueTime,int period,IntPtr callback,IntPtr arg,bool resume);
+    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint ms);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [StructLayout(LayoutKind.Sequential)] struct PowerThrottlingState { public uint Version,ControlMask,StateMask; }
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetProcessInformation(IntPtr process,int infoClass,ref PowerThrottlingState info,int size);
+    static bool throttlingDisabled;
+    // Windows 11 ignores 1 ms timer requests from apps whose window is hidden or
+    // minimized (e.g. while a game is in front), which capped speed near 64 CPS.
+    // Opt this process out of that throttling and of EcoQoS.
+    static void DisablePowerThrottling(){ if(throttlingDisabled)return; throttlingDisabled=true; try{ PowerThrottlingState st=new PowerThrottlingState(); st.Version=1; st.ControlMask=0x1|0x4; st.StateMask=0; SetProcessInformation(GetCurrentProcess(),4,ref st,Marshal.SizeOf(typeof(PowerThrottlingState))); }catch(Exception){} }
+    // Waits until the stopwatch reaches target using a high-resolution waitable
+    // timer (sub-millisecond on Windows 10 1803+), finishing with a short spin.
+    static void WaitUntil(long target,IntPtr timer,long frequency){
+        while(active){
+            long remaining=target-Stopwatch.GetTimestamp();
+            if(remaining<=0) return;
+            double ms=remaining*1000.0/frequency;
+            if(ms>1.0){
+                double chunk=Math.Min(ms-0.5,50.0);
+                if(timer!=IntPtr.Zero){ long due=-(long)(chunk*10000.0); if(SetWaitableTimer(timer,ref due,0,IntPtr.Zero,IntPtr.Zero,false)){ WaitForSingleObject(timer,100); continue; } }
+                Thread.Sleep(ms>2.0?1:0);
+            } else Thread.Yield();
+        }
+    }
     public static void Configure(int random,int hold,int clicks,int seconds,bool corner,int cornerSize,bool edge,int edgeSize,bool keyMode,int key,bool dbl,int[] clickPoints,int radius,int pointClicks) {
         randomPct=random;holdPct=hold;maxClicks=clicks;maxSeconds=seconds;useCorner=corner;cornerPx=cornerSize;useEdge=edge;edgePx=edgeSize;
         keyboard=keyMode;keyCode=key;doubleClick=dbl;points=clickPoints??new int[0];pointRadius=Math.Max(0,radius);clicksPerPoint=Math.Max(1,pointClicks);
@@ -54,12 +70,15 @@ public static class ClickNative {
     public static long Count { get { return Interlocked.Read(ref sent); } }
     public static bool Active { get { return active; } }
     public static int[] Cursor { get { POINT p; GetCursorPos(out p); return new int[]{p.X,p.Y}; } }
-    public static void Start(uint downFlag, uint upFlag, int intervalMs) {
-        Stop(); periodSet=(timeBeginPeriod(1)==0); down=downFlag; up=upFlag; Interlocked.Exchange(ref sent,0); active=true;
+    public static void Start(uint downFlag, uint upFlag, double intervalMs) {
+        Stop(); DisablePowerThrottling(); periodSet=(timeBeginPeriod(1)==0); if(intervalMs<0.1) intervalMs=0.1; down=downFlag; up=upFlag; Interlocked.Exchange(ref sent,0); active=true;
         worker=new Thread(() => {
             long frequency=Stopwatch.Frequency;
-            long period=Math.Max(1L, (long)(frequency * (intervalMs / 1000.0)));
-            long next=Stopwatch.GetTimestamp(); long started=next; int pointIndex=0,clicksAtPoint=0;
+            double period=Math.Max(1.0, frequency * (intervalMs / 1000.0));
+            long started=Stopwatch.GetTimestamp(); double next=started; int pointIndex=0,clicksAtPoint=0;
+            IntPtr timer=CreateWaitableTimerExW(IntPtr.Zero,null,0x2,0x1F0003);
+            if(timer==IntPtr.Zero) timer=CreateWaitableTimerExW(IntPtr.Zero,null,0,0x1F0003);
+            try {
             while(active) {
                 if(maxSeconds>0 && (Stopwatch.GetTimestamp()-started)/((double)frequency)>=maxSeconds) { active=false; break; }
                 if(TargetProcessId>0) { uint foregroundPid; GetWindowThreadProcessId(GetForegroundWindow(),out foregroundPid); if(foregroundPid!=(uint)TargetProcessId) { Thread.Sleep(1); continue; } }
@@ -68,633 +87,2970 @@ public static class ClickNative {
                 if(useCorner && ((pos.X<bounds.Left+cornerPx&&pos.Y<bounds.Top+cornerPx)||(pos.X<bounds.Left+cornerPx&&pos.Y>=bounds.Bottom-cornerPx)||(pos.X>=bounds.Right-cornerPx&&pos.Y<bounds.Top+cornerPx)||(pos.X>=bounds.Right-cornerPx&&pos.Y>=bounds.Bottom-cornerPx))) { active=false; break; }
                 if(useEdge && (pos.X<bounds.Left+edgePx||pos.Y<bounds.Top+edgePx||pos.X>=bounds.Right-edgePx||pos.Y>=bounds.Bottom-edgePx)) { active=false; break; }
                 if(!active) break;
-                if(points.Length>=2 && clicksAtPoint==0) { int px=points[pointIndex],py=points[pointIndex+1];if(pointRadius>0){double a=rng.NextDouble()*Math.PI*2,r=Math.Sqrt(rng.NextDouble())*pointRadius;px+=(int)Math.Round(Math.Cos(a)*r);py+=(int)Math.Round(Math.Sin(a)*r);}SetCursorPos(px,py); }
+                if(points.Length>=2 && clicksAtPoint==0) { int px=points[pointIndex],py=points[pointIndex+1];if(pointRadius>0){double a=rng.NextDouble()*Math.PI*2,r=Math.Sqrt(rng.NextDouble())*pointRadius;px+=(int)Math.Round(Math.Cos(a)*r);py+=(int)Math.Round(Math.Sin(a)*r);}if(px!=pos.X||py!=pos.Y) SetCursorPos(px,py); }
                 int repeats=doubleClick?2:1;
                 for(int n=0;n<repeats && active;n++) {
-                    if(keyboard) { keybd_event((byte)keyCode,0,0,UIntPtr.Zero); if(holdPct>0) HoldFor(Math.Max(1,intervalMs*holdPct/100)); keybd_event((byte)keyCode,0,2,UIntPtr.Zero); }
-                    else { mouse_event(down,0,0,0,UIntPtr.Zero); if(holdPct>0) HoldFor(Math.Max(1,intervalMs*holdPct/100)); mouse_event(up,0,0,0,UIntPtr.Zero); }
+                    if(keyboard) { keybd_event((byte)keyCode,0,0,UIntPtr.Zero); if(holdPct>0) HoldFor((int)Math.Max(1,intervalMs*holdPct/100.0)); keybd_event((byte)keyCode,0,2,UIntPtr.Zero); }
+                    else { mouse_event(down,0,0,0,UIntPtr.Zero); if(holdPct>0) HoldFor((int)Math.Max(1,intervalMs*holdPct/100.0)); mouse_event(up,0,0,0,UIntPtr.Zero); }
                     Interlocked.Increment(ref sent);
                     if(points.Length>=2 && ++clicksAtPoint>=clicksPerPoint){clicksAtPoint=0;pointIndex=(pointIndex+2)%points.Length;}
                     if(maxClicks>0 && Count>=maxClicks) { active=false; break; }
                 }
                 int variation=randomPct==0?0:rng.Next(-randomPct,randomPct+1);
-                long wait=Math.Max(1,period*(100+variation)/100); next += wait;
-                while(active) {
-                    long remaining=next-Stopwatch.GetTimestamp();
-                    if(remaining<=0) break;
-                    if(remaining > frequency/500) Thread.Sleep(1);
-                    else Thread.Yield();
-                }
+                next += Math.Max(1.0,period*(100+variation)/100.0);
+                // After a stall (PC lag, window drag), resync instead of firing a catch-up burst.
+                long now=Stopwatch.GetTimestamp();
+                if(next < now - frequency/20) next=now;
+                WaitUntil((long)next,timer,frequency);
             }
+            } finally { if(timer!=IntPtr.Zero) CloseHandle(timer); }
         }); worker.IsBackground=true; worker.Priority=ThreadPriority.Highest; worker.Start();
     }
     public static void Stop() { active=false; if(worker!=null && worker.IsAlive) worker.Join(100); worker=null; if(periodSet){timeEndPeriod(1);periodSet=false;} }
 }
+
 public static class LogoColorizer {
     static Color HsvToColor(double h,double s,double v,int alpha){double c=v*s,x=c*(1-Math.Abs((h/60.0%2)-1)),m=v-c,r=0,g=0,b=0;if(h<60){r=c;g=x;}else if(h<120){r=x;g=c;}else if(h<180){g=c;b=x;}else if(h<240){g=x;b=c;}else if(h<300){r=x;b=c;}else{r=c;b=x;}return Color.FromArgb(alpha,(int)Math.Round((r+m)*255),(int)Math.Round((g+m)*255),(int)Math.Round((b+m)*255));}
     public static Bitmap Tint(Bitmap source,Color accent){Bitmap normalized=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppArgb);using(Graphics g=Graphics.FromImage(normalized)){g.DrawImage(source,0,0,source.Width,source.Height);}Bitmap result=new Bitmap(source.Width,source.Height,PixelFormat.Format32bppArgb);Rectangle area=new Rectangle(0,0,source.Width,source.Height);BitmapData input=normalized.LockBits(area,ImageLockMode.ReadOnly,PixelFormat.Format32bppArgb);BitmapData output=result.LockBits(area,ImageLockMode.WriteOnly,PixelFormat.Format32bppArgb);byte[] row=new byte[source.Width*4];for(int y=0;y<source.Height;y++){Marshal.Copy(IntPtr.Add(input.Scan0,y*input.Stride),row,0,row.Length);for(int x=0;x<source.Width;x++){int i=x*4,b=row[i],g=row[i+1],r=row[i+2],a=row[i+3];int max=Math.Max(r,Math.Max(g,b)),min=Math.Min(r,Math.Min(g,b)),delta=max-min;double h=0,s=max==0?0:delta/(double)max,v=max/255.0;if(delta>0){if(max==r)h=60.0*(((g-b)/(double)delta)%6);else if(max==g)h=60.0*(((b-r)/(double)delta)+2);else h=60.0*(((r-g)/(double)delta)+4);if(h<0)h+=360;}if(a>0&&h>=245&&h<=325&&s>=0.24&&v>=0.26){row[i]=(byte)Math.Round(accent.B*v);row[i+1]=(byte)Math.Round(accent.G*v);row[i+2]=(byte)Math.Round(accent.R*v);}}Marshal.Copy(row,0,IntPtr.Add(output.Scan0,y*output.Stride),row.Length);}normalized.UnlockBits(input);result.UnlockBits(output);normalized.Dispose();return result;}
     public static Icon MakeIcon(Bitmap bitmap){using(Bitmap small=new Bitmap(64,64,PixelFormat.Format32bppArgb)){using(Graphics g=Graphics.FromImage(small)){g.Clear(Color.Transparent);g.InterpolationMode=InterpolationMode.HighQualityBicubic;g.SmoothingMode=SmoothingMode.HighQuality;g.PixelOffsetMode=PixelOffsetMode.HighQuality;g.DrawImage(bitmap,0,0,64,64);}IntPtr handle=small.GetHicon();try{using(Icon icon=Icon.FromHandle(handle)){return (Icon)icon.Clone();}}finally{ClickNative.DestroyIcon(handle);}}}
 }
-public class SmoothCanvas : System.Windows.Forms.Panel { public SmoothCanvas(){ DoubleBuffered=true; ResizeRedraw=true; } }
-public class TapForgeSwitch : System.Windows.Forms.CheckBox {
-    public static Color AccentColor=Color.FromArgb(123,97,255);
-    public TapForgeSwitch(){AutoSize=false;Text=String.Empty;Size=new Size(46,26);BackColor=Color.Transparent;Cursor=Cursors.Hand;SetStyle(ControlStyles.UserPaint|ControlStyles.AllPaintingInWmPaint|ControlStyles.OptimizedDoubleBuffer|ControlStyles.SupportsTransparentBackColor,true);}
-    protected override void OnCheckedChanged(EventArgs e){base.OnCheckedChanged(e);Invalidate();}
-    protected override void OnPaint(PaintEventArgs e){base.OnPaintBackground(e);e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;int h=20,w=42,x=2,y=(Height-h)/2;Color track=Checked?AccentColor:Color.FromArgb(76,82,96);using(GraphicsPath p=new GraphicsPath()){p.AddArc(x,y,h,h,90,180);p.AddArc(x+w-h,y,w-h,h,270,180);p.CloseFigure();using(Brush b=new SolidBrush(track))e.Graphics.FillPath(b,p);}int d=14;int thumbX=Checked?x+w-h+3:x+3;using(Brush b=new SolidBrush(Color.White))e.Graphics.FillEllipse(b,thumbX,y+3,d,d);if(Focused){using(Pen p=new Pen(AccentColor,1))e.Graphics.DrawRectangle(p,0,0,Width-1,Height-1);}}
-}
-public class TapForgeCard : System.Windows.Forms.Panel {
-    public static Color BorderColor=Color.FromArgb(45,52,69);
-    const int Radius=14;
-    static GraphicsPath Shape(Rectangle r){int d=Radius*2;GraphicsPath p=new GraphicsPath();if(r.Width<d||r.Height<d){p.AddRectangle(r);return p;}p.AddArc(r.X,r.Y,d,d,180,90);p.AddArc(r.Right-d,r.Y,d,d,270,90);p.AddArc(r.Right-d,r.Bottom-d,d,d,0,90);p.AddArc(r.X,r.Bottom-d,d,d,90,90);p.CloseFigure();return p;}
-    public TapForgeCard(){DoubleBuffered=true;ResizeRedraw=true;SetStyle(ControlStyles.UserPaint|ControlStyles.AllPaintingInWmPaint|ControlStyles.OptimizedDoubleBuffer|ControlStyles.SupportsTransparentBackColor,true);}
-    protected override void OnResize(EventArgs e){base.OnResize(e);using(GraphicsPath p=Shape(new Rectangle(0,0,Width,Height)))Region=new Region(p);}
-    protected override void OnPaintBackground(PaintEventArgs e){e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;using(GraphicsPath p=Shape(new Rectangle(0,0,Width-1,Height-1)))using(Brush b=new SolidBrush(BackColor))e.Graphics.FillPath(b,p);}
-    protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;using(GraphicsPath p=Shape(new Rectangle(0,0,Width-1,Height-1)))using(Pen pen=new Pen(BorderColor,1))e.Graphics.DrawPath(pen,p);}
-}
-public class TapForgeLabel : System.Windows.Forms.Label {
-    public TapForgeLabel(){SetStyle(ControlStyles.OptimizedDoubleBuffer|ControlStyles.AllPaintingInWmPaint|ControlStyles.SupportsTransparentBackColor,true);BackColor=Color.Transparent;}
-    protected override void OnPaintBackground(PaintEventArgs e){base.OnPaintBackground(e);}
-}
-public class HuePickerControl : System.Windows.Forms.Panel {
-    public double Hue=252, Saturation=0.62, Brightness=1.0;
-    Bitmap hueMap;
-    bool dragging, hueDrag;
-    public HuePickerControl(){ DoubleBuffered=true; ResizeRedraw=true; BackColor=System.Drawing.Color.FromArgb(24,29,43); hueMap=new Bitmap(360,24); using(Graphics g=Graphics.FromImage(hueMap)){ for(int x=0;x<360;x++){ Color c=Hsv(x,1,1); using(Brush b=new SolidBrush(c)) g.FillRectangle(b,x,0,1,24); } } }
-    static Color Hsv(double h,double s,double v){ double c=v*s, x=c*(1-Math.Abs((h/60.0%2)-1)), m=v-c, r=0,g=0,b=0; if(h<60){r=c;g=x;} else if(h<120){r=x;g=c;} else if(h<180){g=c;b=x;} else if(h<240){g=x;b=c;} else if(h<300){r=x;b=c;} else {r=c;b=x;} return Color.FromArgb(255,(int)((r+m)*255),(int)((g+m)*255),(int)((b+m)*255)); }
-    public Color SelectedColor { get { return Hsv(Hue,Saturation,Brightness); } }
-    void UpdateFromPoint(int px,int py){ if(hueDrag){Hue=Math.Max(0,Math.Min(359,px/(double)Math.Max(1,Width)*360));} else { Saturation=Math.Max(0,Math.Min(1,px/(double)Math.Max(1,Width-1))); Brightness=1-Math.Max(0,Math.Min(1,py/200.0)); } Invalidate(); }
-    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e){ base.OnMouseDown(e); if(e.Button==System.Windows.Forms.MouseButtons.Left){ dragging=true; Capture=true; hueDrag=e.Y>=210; UpdateFromPoint(e.X,e.Y); } }
-    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e){ base.OnMouseMove(e); if(dragging) UpdateFromPoint(e.X,e.Y); }
-    protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e){ base.OnMouseUp(e); if(e.Button==System.Windows.Forms.MouseButtons.Left){ dragging=false; Capture=false; } }
-    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e){ base.OnPaint(e); Rectangle square=new Rectangle(0,0,Width,200); using(Brush whiteHue=new LinearGradientBrush(square,Color.White,Hsv(Hue,1,1),0f)) e.Graphics.FillRectangle(whiteHue,square); using(Brush shade=new LinearGradientBrush(square,Color.FromArgb(0,0,0,0),Color.FromArgb(255,0,0,0),LinearGradientMode.Vertical)) e.Graphics.FillRectangle(shade,square); if(hueMap!=null)e.Graphics.DrawImage(hueMap,new Rectangle(0,214,Width,24)); int sx=(int)(Saturation*(Width-1)), sy=(int)((1-Brightness)*200); using(Pen p=new Pen(Color.Black,3))e.Graphics.DrawEllipse(p,sx-7,sy-7,14,14); using(Pen p=new Pen(Color.White,2))e.Graphics.DrawEllipse(p,sx-7,sy-7,14,14); int hx=(int)(Hue/360.0*Width); e.Graphics.DrawRectangle(Pens.Black,hx-3,213,6,25); e.Graphics.DrawRectangle(Pens.White,hx-2,214,4,23); }
-    protected override void Dispose(bool disposing){ if(disposing&&hueMap!=null){hueMap.Dispose();hueMap=null;} base.Dispose(disposing); }
-}
-public class AccentSlider : System.Windows.Forms.Panel {
-    public int Minimum=0, Maximum=100;
-    int currentValue=50;
-    bool dragging;
-    public static Color AccentColor=Color.FromArgb(123,97,255);
-    public event EventHandler ValueChanged;
-    public int Value { get { return currentValue; } set { int v=Math.Max(Minimum,Math.Min(Maximum,value)); if(v!=currentValue){currentValue=v;Invalidate();if(ValueChanged!=null)ValueChanged(this,EventArgs.Empty);} } }
-    public AccentSlider(){DoubleBuffered=true;ResizeRedraw=true;Height=36;BackColor=Color.FromArgb(24,29,43);Cursor=System.Windows.Forms.Cursors.Hand;}
-    void SetFromX(int x){int span=Math.Max(1,Width-20);Value=Minimum+(int)Math.Round(Math.Max(0,Math.Min(1,(x-10)/(double)span))*(Maximum-Minimum));}
-    protected override void OnMouseDown(System.Windows.Forms.MouseEventArgs e){base.OnMouseDown(e);if(e.Button==System.Windows.Forms.MouseButtons.Left){dragging=true;Capture=true;SetFromX(e.X);}}
-    protected override void OnMouseMove(System.Windows.Forms.MouseEventArgs e){base.OnMouseMove(e);if(dragging)SetFromX(e.X);}
-    protected override void OnMouseUp(System.Windows.Forms.MouseEventArgs e){base.OnMouseUp(e);if(e.Button==System.Windows.Forms.MouseButtons.Left){dragging=false;Capture=false;}}
-    protected override void OnMouseWheel(System.Windows.Forms.MouseEventArgs e){base.OnMouseWheel(e);Value+=Math.Sign(e.Delta);}
-    protected override void OnPaint(System.Windows.Forms.PaintEventArgs e){base.OnPaint(e);int left=10,right=Width-10,y=Height/2;int x=left+(int)((right-left)*(Value-Minimum)/(double)Math.Max(1,Maximum-Minimum));using(Pen track=new Pen(Color.FromArgb(74,79,91),4))e.Graphics.DrawLine(track,left,y,right,y);using(Pen fill=new Pen(AccentColor,4))e.Graphics.DrawLine(fill,left,y,x,y);using(Brush thumb=new SolidBrush(AccentColor))e.Graphics.FillEllipse(thumb,x-7,y-7,14,14);using(Pen edge=new Pen(Color.FromArgb(230,230,238),1))e.Graphics.DrawEllipse(edge,x-7,y-7,14,14);}
-}
-public class AccentArrow : System.Windows.Forms.Panel {
-    public static Color AccentColor=Color.FromArgb(123,97,255);
-    public AccentArrow(){DoubleBuffered=true;Cursor=Cursors.Hand;}
-    protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(Brush b=new SolidBrush(AccentColor))e.Graphics.FillRectangle(b,ClientRectangle);int cx=Width/2,cy=Height/2;using(Pen p=new Pen(Color.White,2)){e.Graphics.DrawLine(p,cx-4,cy-2,cx,cy+2);e.Graphics.DrawLine(p,cx,cy+2,cx+4,cy-2);}}
-}
-public class AccentSpinner : System.Windows.Forms.Panel {
-    public static Color AccentColor=Color.FromArgb(123,97,255);
-    public NumericUpDown Target;
-    public AccentSpinner(NumericUpDown target){Target=target;DoubleBuffered=true;Cursor=Cursors.Hand;}
-    protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);using(Brush b=new SolidBrush(AccentColor))e.Graphics.FillRectangle(b,ClientRectangle);int cx=Width/2, top=Height/4, bottom=Height*3/4;using(Brush b=new SolidBrush(Color.White)){Point[] up={new Point(cx-4,top+2),new Point(cx+4,top+2),new Point(cx,top-2)};Point[] down={new Point(cx-4,bottom-2),new Point(cx+4,bottom-2),new Point(cx,bottom+2)};e.Graphics.FillPolygon(b,up);e.Graphics.FillPolygon(b,down);}}
-    protected override void OnMouseDown(MouseEventArgs e){base.OnMouseDown(e);if(e.Button==MouseButtons.Left&&Target!=null){if(e.Y<Height/2)Target.UpButton();else Target.DownButton();Target.Focus();}}
-}
-public class AccentFrameLine : System.Windows.Forms.Panel {
-    public static Color OutlineColor=Color.FromArgb(90,90,105);
-    public AccentFrameLine(){Enabled=false;}
-    protected override void OnPaint(PaintEventArgs e){using(Brush b=new SolidBrush(OutlineColor))e.Graphics.FillRectangle(b,ClientRectangle);}
-}
-'@ -ReferencedAssemblies @('System.Windows.Forms.dll','System.Drawing.dll')
 
-[System.Windows.Forms.Application]::EnableVisualStyles()
-$script:running = $false
-$script:clickTimer = $null
-$script:clickCount = 0L
-$script:stopwatch = [System.Diagnostics.Stopwatch]::new()
-$script:lastF6 = $false
-$script:lastF7 = $false
-$script:colorBg = [System.Drawing.Color]::FromArgb(15,18,28)
-$script:colorPanel = [System.Drawing.Color]::FromArgb(24,29,43)
-$script:colorAccent = [System.Drawing.Color]::FromArgb(123,97,255)
-$script:colorMuted = [System.Drawing.Color]::FromArgb(151,161,181)
-
-function New-Label($text, $x, $y, $w, $h, $size = 10, $color = $script:colorMuted, $bold = $false) {
-    $l = [TapForgeLabel]::new()
-    $l.Text = $text; $l.Location = [System.Drawing.Point]::new($x,$y); $l.Size = [System.Drawing.Size]::new($w,$h)
-    $l.ForeColor = $color; if($color.ToArgb() -eq $script:colorMuted.ToArgb()){$l.Tag='muted'}; $l.Font = [System.Drawing.Font]::new('Segoe UI',$size, $(if($bold){[System.Drawing.FontStyle]::Bold}else{[System.Drawing.FontStyle]::Regular}))
-    $l
-}
-function New-Card($x,$y,$w,$h) {
-    $p = [TapForgeCard]::new(); $p.Location = [System.Drawing.Point]::new($x,$y); $p.Size = [System.Drawing.Size]::new($w,$h)
-    $p.BackColor = $script:colorPanel; $p.Tag='surface'; $p
-}
-function New-Button($text,$x,$y,$w,$h,$back,$fore) {
-    $b = [System.Windows.Forms.Button]::new(); $b.Text=$text; $b.Location=[System.Drawing.Point]::new($x,$y); $b.Size=[System.Drawing.Size]::new($w,$h)
-    $b.FlatStyle='Flat'; $b.FlatAppearance.BorderSize=0; $b.BackColor=$back; $b.ForeColor=$fore; if($back.ToArgb() -eq $script:colorAccent.ToArgb()){$b.Tag='primary'}; $b.Font=[System.Drawing.Font]::new('Segoe UI',10,[System.Drawing.FontStyle]::Bold); $b.Cursor='Hand'; $b
-}
-function Get-HsvColor([double]$h,[double]$s,[double]$v) {
-    $c=$v*$s; $x=$c*(1-[Math]::Abs((($h/60)%2)-1)); $m=$v-$c
-    if($h -lt 60){$r=$c;$g=$x;$b=0}elseif($h -lt 120){$r=$x;$g=$c;$b=0}elseif($h -lt 180){$r=0;$g=$c;$b=$x}elseif($h -lt 240){$r=0;$g=$x;$b=$c}elseif($h -lt 300){$r=$x;$g=0;$b=$c}else{$r=$c;$g=0;$b=$x}
-    [System.Drawing.Color]::FromArgb(255,[int](($r+$m)*255),[int](($g+$m)*255),[int](($b+$m)*255))
-}
-function Show-HuePicker([System.Drawing.Color]$initialColor) {
-    $rr=$initialColor.R/255.0;$gg=$initialColor.G/255.0;$bb=$initialColor.B/255.0;$mx=[Math]::Max($rr,[Math]::Max($gg,$bb));$mn=[Math]::Min($rr,[Math]::Min($gg,$bb));$delta=$mx-$mn;$script:hue=0.0
-    if($delta -gt 0){if($mx -eq $rr){$script:hue=60*((($gg-$bb)/$delta)%6)}elseif($mx -eq $gg){$script:hue=60*((($bb-$rr)/$delta)+2)}else{$script:hue=60*((($rr-$gg)/$delta)+4)}};if($script:hue -lt 0){$script:hue+=360};$script:saturation=if($mx -eq 0){0.0}else{$delta/$mx};$script:value=$mx;$script:hueResult=$null
-    $script:hueAccepted=$false;$script:hueForm=[System.Windows.Forms.Form]::new();$script:hueForm.Text='Choose accent color';$script:hueForm.Size=[System.Drawing.Size]::new(390,430);$script:hueForm.StartPosition='CenterParent';$script:hueForm.FormBorderStyle='FixedDialog';$script:hueForm.MaximizeBox=$false;$script:hueForm.MinimizeBox=$false;$script:hueForm.BackColor=$script:colorBg;$script:hueForm.ForeColor=[System.Drawing.Color]::White
-    $script:hueForm.Add_HandleCreated({Enable-DarkChrome $script:hueForm})
-    $script:picker=[HuePickerControl]::new();$script:picker.Location=[System.Drawing.Point]::new(24,24);$script:picker.Size=[System.Drawing.Size]::new(320,244);$script:picker.Hue=$script:hue;$script:picker.Saturation=$script:saturation;$script:picker.Brightness=$script:value;$script:hueForm.Controls.Add($script:picker)
-    $script:colorPreview=[System.Windows.Forms.Panel]::new();$script:colorPreview.Location=[System.Drawing.Point]::new(24,284);$script:colorPreview.Size=[System.Drawing.Size]::new(54,38);$script:colorPreview.BackColor=$initialColor;$script:hueForm.Controls.Add($script:colorPreview)
-    $script:hexLabel=New-Label ('#'+$initialColor.R.ToString('X2')+$initialColor.G.ToString('X2')+$initialColor.B.ToString('X2')) 92 289 150 28 12 ([System.Drawing.Color]::White) $true;$script:hueForm.Controls.Add($script:hexLabel)
-    $script:pickerTimer=[System.Windows.Forms.Timer]::new();$script:pickerTimer.Interval=35;$script:pickerTimer.Add_Tick({$c=$script:picker.SelectedColor;$script:colorPreview.BackColor=$c;$script:hexLabel.Text='#'+$c.R.ToString('X2')+$c.G.ToString('X2')+$c.B.ToString('X2')});$script:pickerTimer.Start()
-    $apply=New-Button 'Apply color' 212 344 132 34 $script:colorAccent ([System.Drawing.Color]::White);$script:hueForm.Controls.Add($apply);$cancel=New-Button 'Cancel' 68 344 124 34 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$script:hueForm.Controls.Add($cancel)
-    $apply.Add_Click({$script:hueResult=$script:picker.SelectedColor;$script:hueAccepted=$true;$script:hueForm.Close()});$cancel.Add_Click({$script:hueForm.Close()})
-    [void]$script:hueForm.ShowDialog($form);$script:pickerTimer.Stop();$script:pickerTimer.Dispose();$script:picker.Dispose();if($script:hueAccepted){$script:hueResult}else{$null}
-}
-
-$form = [TapForgeWindow]::new()
-$form.Text='TapForge'; $form.Size=[System.Drawing.Size]::new(1080,800); $form.MinimumSize=[System.Drawing.Size]::new(1080,780); $form.AutoScroll=$false
-$form.StartPosition='CenterScreen'; $form.BackColor=$script:colorBg; $form.ForeColor=[System.Drawing.Color]::White; $form.Font=[System.Drawing.Font]::new('Segoe UI',10)
-$form.FormBorderStyle='None'; $form.MaximizeBox=$true
-$script:logoPath=Join-Path $PSScriptRoot 'TapForge.ico';$script:logoIcon=[System.Drawing.Icon]::new($script:logoPath);$script:logoSourcePath=Join-Path $PSScriptRoot 'TapForgeLogo.png';$script:logoSourceImage=[System.Drawing.Bitmap]::FromFile($script:logoSourcePath);$script:brandImage=$script:logoSourceImage.Clone()
-$brandMark=[System.Windows.Forms.PictureBox]::new();$brandMark.Size=[System.Drawing.Size]::new(34,34);$brandMark.SizeMode='Zoom';$brandMark.BackColor=[System.Drawing.Color]::Transparent;$brandMark.Image=$script:brandImage;$brandMark.AccessibleName='TapForge logo';$script:brandMark=$brandMark
-$brandTitle=New-Label 'TapForge' 0 0 118 32 17 ([System.Drawing.Color]::White) $true;$brandTitle.Font=[System.Drawing.Font]::new('Bahnschrift',17,[System.Drawing.FontStyle]::Bold)
-$statusPill = New-Label '●  READY' 0 0 78 24 9 ([System.Drawing.Color]::FromArgb(108,220,170)) $true
-
-$settings = New-Card 26 96 442 396; $form.Controls.Add($settings)
-$form.Controls.Add((New-Label 'Click settings' 48 114 250 30 14 ([System.Drawing.Color]::White) $true))
-$form.Controls.Add((New-Label 'Set your click pattern and activation behavior.' 48 144 390 24 9 $script:colorMuted))
-
-$settings.Controls.Add((New-Label 'BUTTON' 22 62 130 22 8 $script:colorMuted $true))
-$buttonPick=[System.Windows.Forms.ComboBox]::new(); $buttonPick.Location=[System.Drawing.Point]::new(22,87); $buttonPick.Size=[System.Drawing.Size]::new(185,34); $buttonPick.DropDownStyle='DropDownList'; $buttonPick.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $buttonPick.ForeColor=[System.Drawing.Color]::White; $buttonPick.FlatStyle='Flat'; [void]$buttonPick.Items.AddRange(@('Left click','Right click','Middle click')); $buttonPick.SelectedIndex=0; $settings.Controls.Add($buttonPick)
-$settings.Controls.Add((New-Label 'CLICK INTERVAL' 232 62 240 22 8 $script:colorMuted $true))
-$interval=[System.Windows.Forms.NumericUpDown]::new(); $interval.Location=[System.Drawing.Point]::new(232,87); $interval.Size=[System.Drawing.Size]::new(112,34); $interval.Minimum=1; $interval.Maximum=3600000; $interval.Value=100; $interval.Increment=10; $interval.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $interval.ForeColor=[System.Drawing.Color]::White; $interval.BorderStyle='FixedSingle'; $settings.Controls.Add($interval)
-$intervalUnit=[System.Windows.Forms.ComboBox]::new();$intervalUnit.Location=[System.Drawing.Point]::new(352,87);$intervalUnit.Size=[System.Drawing.Size]::new(120,34);$intervalUnit.DropDownStyle='DropDownList';$intervalUnit.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$intervalUnit.ForeColor=[System.Drawing.Color]::White;$intervalUnit.FlatStyle='Flat';[void]$intervalUnit.Items.AddRange(@('Milliseconds','Seconds','Minutes'));$intervalUnit.SelectedIndex=0;$settings.Controls.Add($intervalUnit)
-$settings.Controls.Add((New-Label 'Time between clicks · max 60 minutes' 232 122 240 20 8 $script:colorMuted))
-function Get-IntervalMilliseconds { $factor=([decimal[]]@(1,1000,60000))[$intervalUnit.SelectedIndex];[long][Math]::Max(1,[Math]::Round([double]$interval.Value*[double]$factor)) }
-function Set-IntervalMilliseconds([long]$milliseconds) { $index=$intervalUnit.SelectedIndex;$factor=([decimal[]]@(1,1000,60000))[$index];$minimum=([decimal[]]@(1,0.001,0.00002))[$index];$maximum=([decimal[]]@(3600000,3600,60))[$index];$places=([int[]]@(0,3,5))[$index];$increment=([decimal[]]@(10,0.01,0.001))[$index];$interval.Value=$interval.Minimum;$interval.DecimalPlaces=$places;$interval.Minimum=$minimum;$interval.Maximum=$maximum;$interval.Increment=$increment;$shown=[decimal]$milliseconds/$factor;$interval.Value=[Math]::Min($maximum,[Math]::Max($minimum,$shown)) }
-$script:intervalMilliseconds=100;$script:intervalUnitIndex=0
-$interval.Add_ValueChanged({$factor=([decimal[]]@(1,1000,60000))[$script:intervalUnitIndex];$script:intervalMilliseconds=[long][Math]::Max(1,[Math]::Round([double]$interval.Value*[double]$factor))})
-$intervalUnit.Add_SelectedIndexChanged({if($intervalUnit.SelectedIndex -ge 0){$ms=$script:intervalMilliseconds;$script:intervalUnitIndex=$intervalUnit.SelectedIndex;Set-IntervalMilliseconds $ms;$interval.Enabled=($speedMode.SelectedIndex -eq 0)}})
-
-$settings.Controls.Add((New-Label 'STOP AFTER' 22 159 160 22 8 $script:colorMuted $true))
-$modePick=[System.Windows.Forms.ComboBox]::new(); $modePick.Location=[System.Drawing.Point]::new(22,184); $modePick.Size=[System.Drawing.Size]::new(185,34); $modePick.DropDownStyle='DropDownList'; $modePick.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $modePick.ForeColor=[System.Drawing.Color]::White; $modePick.FlatStyle='Flat'; [void]$modePick.Items.AddRange(@('Until stopped','Number of clicks','Time limit')); $modePick.SelectedIndex=0; $settings.Controls.Add($modePick)
-$limit=[System.Windows.Forms.NumericUpDown]::new(); $limit.Location=[System.Drawing.Point]::new(232,184); $limit.Size=[System.Drawing.Size]::new(160,34); $limit.Minimum=1; $limit.Maximum=10000000; $limit.Value=100; $limit.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $limit.ForeColor=[System.Drawing.Color]::White; $settings.Controls.Add($limit)
-$limitHint=New-Label 'clicks' 232 219 180 20 8 $script:colorMuted; $settings.Controls.Add($limitHint)
-$modePick.Add_SelectedIndexChanged({ $limitHint.Text=@('No limit','clicks','seconds')[$modePick.SelectedIndex]; $limit.Enabled=($modePick.SelectedIndex -ne 0) })
-$limit.Enabled=$false
-
-$settings.Controls.Add((New-Label 'START / STOP HOTKEY' 22 257 180 22 8 $script:colorMuted $true))
-$keyPick=[System.Windows.Forms.ComboBox]::new(); $keyPick.Location=[System.Drawing.Point]::new(22,282); $keyPick.Size=[System.Drawing.Size]::new(185,34); $keyPick.DropDownStyle='DropDownList'; $keyPick.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $keyPick.ForeColor=[System.Drawing.Color]::White; $keyPick.FlatStyle='Flat'; [void]$keyPick.Items.AddRange(@('F6','F8','F9','F10','F11','F12')); $keyPick.SelectedIndex=0; $settings.Controls.Add($keyPick)
-$settings.Controls.Add((New-Label 'Global hotkey · works while minimized' 22 319 390 21 8 $script:colorMuted))
-$settings.Controls.Add((New-Label 'F7 always stops clicking immediately.' 22 350 390 21 8 ([System.Drawing.Color]::FromArgb(190,170,255))))
-@($form.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -eq 'Click settings' }) | ForEach-Object { $form.Controls.Remove($_); $_.Location=[System.Drawing.Point]::new(22,14); $_.Size=[System.Drawing.Size]::new(250,28); $settings.Controls.Add($_) }
-@($form.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -eq 'Set your click pattern and activation behavior.' }) | ForEach-Object { $form.Controls.Remove($_); $_.Location=[System.Drawing.Point]::new(22,39); $_.Size=[System.Drawing.Size]::new(390,20); $settings.Controls.Add($_) }
-@($form.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Text -in @('TapForge  ·  Runs locally on your PC','F6 START/STOP     F7 EMERGENCY STOP') }) | ForEach-Object { $form.Controls.Remove($_) }
-
-$monitor=New-Card 486 96 246 396; $form.Controls.Add($monitor)
-$monitor.Controls.Add((New-Label 'Live monitor' 20 18 200 28 14 ([System.Drawing.Color]::White) $true))
-$monitor.Controls.Add((New-Label 'CLICKS SENT' 20 72 150 20 8 $script:colorMuted $true))
-$countLabel=New-Label '0' 20 96 205 70 34 ([System.Drawing.Color]::White) $true; $monitor.Controls.Add($countLabel)
-$monitor.Controls.Add((New-Label 'ELAPSED' 20 190 150 20 8 $script:colorMuted $true))
-$elapsedLabel=New-Label '00:00:00' 20 216 205 40 20 ([System.Drawing.Color]::White) $true; $monitor.Controls.Add($elapsedLabel)
-$monitor.Controls.Add((New-Label 'CURRENT MODE' 20 285 150 20 8 $script:colorMuted $true))
-$modeLabel=New-Label 'Continuous' 20 310 205 27 12 ([System.Drawing.Color]::FromArgb(166,149,255)) $true; $monitor.Controls.Add($modeLabel)
-$monitor.Controls.Add((New-Label 'Ready when you are.' 20 350 205 24 8 $script:colorMuted))
-
-$startButton=New-Button '▶   Start clicking' 26 512 442 54 $script:colorAccent ([System.Drawing.Color]::White); $form.Controls.Add($startButton)
-$stopButton=New-Button '■   Stop' 486 512 246 54 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White); $form.Controls.Add($stopButton)
-
-# Expanded controls use the same dark card system as the main panel.
-$advanced=New-Card 26 625 850 540; $form.Controls.Add($advanced)
-$advanced.Controls.Add((New-Label 'More control' 22 16 300 30 15 ([System.Drawing.Color]::White) $true))
-$advanced.Controls.Add((New-Label 'Fine-tune the click pattern and set screen safety stops.' 22 47 700 22 9 $script:colorMuted))
-$advanced.Controls.Add((New-Label 'SPEED MODE' 22 83 150 20 8 $script:colorMuted $true))
-$speedMode=[System.Windows.Forms.ComboBox]::new(); $speedMode.Location=[System.Drawing.Point]::new(22,107); $speedMode.Size=[System.Drawing.Size]::new(170,30); $speedMode.DropDownStyle='DropDownList'; [void]$speedMode.Items.AddRange(@('Interval','Clicks per second')); $speedMode.SelectedIndex=0; $speedMode.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $speedMode.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($speedMode)
-$rate=[System.Windows.Forms.NumericUpDown]::new(); $rate.Location=[System.Drawing.Point]::new(207,107); $rate.Size=[System.Drawing.Size]::new(140,30); $rate.Minimum=1; $rate.Maximum=500; $rate.Value=10; $rate.Enabled=$false; $advanced.Controls.Add($rate)
-$speedMode.Add_SelectedIndexChanged({ $rate.Enabled=($speedMode.SelectedIndex -eq 1); $interval.Enabled=($speedMode.SelectedIndex -eq 0);$intervalUnit.Enabled=($speedMode.SelectedIndex -eq 0); if($speedMode.SelectedIndex -eq 1){Set-IntervalMilliseconds ([long][Math]::Max(1,[Math]::Round(1000/[double]$rate.Value)))} })
-$rate.Add_ValueChanged({ if($speedMode.SelectedIndex -eq 1){Set-IntervalMilliseconds ([long][Math]::Max(1,[Math]::Round(1000/[double]$rate.Value)))} })
-$advanced.Controls.Add((New-Label 'GLOBAL HOTKEY BEHAVIOR' 390 83 220 20 8 $script:colorMuted $true))
-$hotkeyMode=[System.Windows.Forms.ComboBox]::new(); $hotkeyMode.Location=[System.Drawing.Point]::new(390,107); $hotkeyMode.Size=[System.Drawing.Size]::new(180,30); $hotkeyMode.DropDownStyle='DropDownList'; [void]$hotkeyMode.Items.AddRange(@('Toggle','Hold while pressed')); $hotkeyMode.SelectedIndex=0; $hotkeyMode.BackColor=[System.Drawing.Color]::FromArgb(34,40,57); $hotkeyMode.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($hotkeyMode)
-$keyboardMode=[System.Windows.Forms.CheckBox]::new(); $keyboardMode.Text='Send keyboard key'; $keyboardMode.Location=[System.Drawing.Point]::new(22,158); $keyboardMode.Size=[System.Drawing.Size]::new(180,25); $keyboardMode.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($keyboardMode)
-$keyCodePick=[System.Windows.Forms.ComboBox]::new(); $keyCodePick.Location=[System.Drawing.Point]::new(207,155); $keyCodePick.Size=[System.Drawing.Size]::new(140,28); $keyCodePick.DropDownStyle='DropDownList'; [void]$keyCodePick.Items.AddRange(@('Space','Enter','A','F')); $keyCodePick.SelectedIndex=0; $keyCodePick.Enabled=$false; $advanced.Controls.Add($keyCodePick)
-$keyboardMode.Add_CheckedChanged({$keyCodePick.Enabled=$keyboardMode.Checked})
-$doubleClick=[System.Windows.Forms.CheckBox]::new(); $doubleClick.Text='Double click'; $doubleClick.Location=[System.Drawing.Point]::new(390,158); $doubleClick.Size=[System.Drawing.Size]::new(150,25); $doubleClick.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($doubleClick)
-$advanced.Controls.Add((New-Label 'DUTY CYCLE · BUTTON HELD (%)' 22 205 260 20 8 $script:colorMuted $true))
-$duty=[System.Windows.Forms.NumericUpDown]::new(); $duty.Location=[System.Drawing.Point]::new(22,230); $duty.Size=[System.Drawing.Size]::new(120,30); $duty.Minimum=0; $duty.Maximum=100; $duty.Value=0; $advanced.Controls.Add($duty)
-$advanced.Controls.Add((New-Label '0 = instant tap' 150 235 160 20 9 $script:colorMuted))
-$advanced.Controls.Add((New-Label 'SPEED RANDOMIZATION (%)' 390 205 250 20 8 $script:colorMuted $true))
-$randomize=[System.Windows.Forms.NumericUpDown]::new(); $randomize.Location=[System.Drawing.Point]::new(390,230); $randomize.Size=[System.Drawing.Size]::new(120,30); $randomize.Minimum=0; $randomize.Maximum=90; $randomize.Value=0; $advanced.Controls.Add($randomize)
-$cornerStop=[System.Windows.Forms.CheckBox]::new(); $cornerStop.Text='Stop at screen corners'; $cornerStop.Location=[System.Drawing.Point]::new(22,287); $cornerStop.Size=[System.Drawing.Size]::new(220,25); $cornerStop.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($cornerStop)
-$cornerSize=[System.Windows.Forms.NumericUpDown]::new(); $cornerSize.Location=[System.Drawing.Point]::new(245,284); $cornerSize.Size=[System.Drawing.Size]::new(95,30); $cornerSize.Minimum=10; $cornerSize.Maximum=500; $cornerSize.Value=50; $advanced.Controls.Add($cornerSize)
-$edgeStop=[System.Windows.Forms.CheckBox]::new(); $edgeStop.Text='Stop at screen edges'; $edgeStop.Location=[System.Drawing.Point]::new(390,287); $edgeStop.Size=[System.Drawing.Size]::new(200,25); $edgeStop.ForeColor=[System.Drawing.Color]::White; $advanced.Controls.Add($edgeStop)
-$edgeSize=[System.Windows.Forms.NumericUpDown]::new(); $edgeSize.Location=[System.Drawing.Point]::new(600,284); $edgeSize.Size=[System.Drawing.Size]::new(95,30); $edgeSize.Minimum=5; $edgeSize.Maximum=300; $edgeSize.Value=40; $advanced.Controls.Add($edgeSize)
-$script:points=[System.Collections.ArrayList]::new()
-$pointList=[System.Windows.Forms.ListBox]::new(); $pointList.Location=[System.Drawing.Point]::new(22,500); $pointList.Size=[System.Drawing.Size]::new(380,92); $advanced.Controls.Add($pointList)
-$pointList.DrawMode='OwnerDrawFixed'; $pointList.BorderStyle='None'; $pointList.ItemHeight=24
-$pointList.Add_DrawItem({param($s,$e) $e.Graphics.FillRectangle([System.Drawing.SolidBrush]::new($script:colorPanel),$e.Bounds);if($e.Index -ge 0){$e.Graphics.DrawString($s.Items[$e.Index],$s.Font,[System.Drawing.SolidBrush]::new([System.Drawing.Color]::White),$e.Bounds)};if(($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0){$e.Graphics.DrawRectangle([System.Drawing.Pen]::new($script:colorAccent,2),[System.Drawing.Rectangle]::Inflate($e.Bounds,-1,-1))}})
-$pickPoint=New-Button 'Pick point' 420 500 140 34 $script:colorAccent ([System.Drawing.Color]::White); $advanced.Controls.Add($pickPoint)
-$removePoint=New-Button 'Remove' 420 542 140 34 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White); $advanced.Controls.Add($removePoint)
-$script:pointPicker=$false
-foreach($control in $advanced.Controls){
-    if($control -is [System.Windows.Forms.NumericUpDown]){$control.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$control.ForeColor=[System.Drawing.Color]::White;$control.BorderStyle='None'}
-    elseif($control -is [System.Windows.Forms.ComboBox]){$control.FlatStyle='Flat'}
-    elseif($control -is [System.Windows.Forms.ListBox]){$control.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$control.ForeColor=[System.Drawing.Color]::White}
-    elseif($control -is [System.Windows.Forms.CheckBox]){$control.BackColor=$script:colorPanel}
-}
-
-# Replace the long, stacked form with compact top navigation and focused pages.
-$pageHost=[System.Windows.Forms.Panel]::new(); $pageHost.Location=[System.Drawing.Point]::new(16,52); $pageHost.Size=[System.Drawing.Size]::new(1018,700); $pageHost.Anchor='Top,Bottom,Left,Right';$pageHost.BackColor=$script:colorBg; $form.Controls.Add($pageHost)
-$navBar=[System.Windows.Forms.Panel]::new(); $navBar.Location=[System.Drawing.Point]::new(0,0); $navBar.Size=[System.Drawing.Size]::new(1080,46);$navBar.Anchor='Top,Left,Right';$navBar.Tag='titlebar';$navBar.BackColor=[System.Drawing.Color]::FromArgb(22,22,22); $form.Controls.Add($navBar)
-$navBar.Controls.Add($brandMark);$navBar.Controls.Add($brandTitle);$navBar.Controls.Add($statusPill)
-$script:titleAccentLine=[System.Windows.Forms.Panel]::new();$script:titleAccentLine.Location=[System.Drawing.Point]::new(0,44);$script:titleAccentLine.Size=[System.Drawing.Size]::new(1080,2);$script:titleAccentLine.Anchor='Bottom,Left,Right';$script:titleAccentLine.BackColor=$script:colorAccent;$navBar.Controls.Add($script:titleAccentLine)
-$settingsBar=[System.Windows.Forms.Panel]::new();$settingsBar.Location=[System.Drawing.Point]::new(16,52);$settingsBar.Size=[System.Drawing.Size]::new(152,700);$settingsBar.Anchor='Top,Bottom,Left';$settingsBar.BackColor=$script:colorPanel;$settingsBar.Visible=$false;$form.Controls.Add($settingsBar)
-$settingsBar.Controls.Add((New-Label 'SETTINGS' 12 8 126 22 8 $script:colorMuted $true))
-$clickPage=[System.Windows.Forms.Panel]::new(); $clickPage.Size=$pageHost.Size; $clickPage.BackColor=[System.Drawing.Color]::Transparent
-$behaviorPage=[System.Windows.Forms.Panel]::new(); $behaviorPage.Size=$pageHost.Size; $behaviorPage.BackColor=[System.Drawing.Color]::Transparent
-$appearancePage=[System.Windows.Forms.Panel]::new(); $appearancePage.Size=$pageHost.Size; $appearancePage.BackColor=[System.Drawing.Color]::Transparent; $appearancePage.AutoScroll=$false
-$clickPointsPage=[System.Windows.Forms.Panel]::new();$clickPointsPage.Size=$pageHost.Size;$clickPointsPage.BackColor=[System.Drawing.Color]::Transparent
-$keybindPage=[System.Windows.Forms.Panel]::new();$keybindPage.Size=$pageHost.Size;$keybindPage.BackColor=[System.Drawing.Color]::Transparent;$keybindPage.AutoScroll=$true
-$processPage=[System.Windows.Forms.Panel]::new();$processPage.Size=$pageHost.Size;$processPage.BackColor=[System.Drawing.Color]::Transparent
-$presetsPage=[System.Windows.Forms.Panel]::new();$presetsPage.Size=$pageHost.Size;$presetsPage.BackColor=[System.Drawing.Color]::Transparent
-$maintenancePage=[System.Windows.Forms.Panel]::new();$maintenancePage.Size=$pageHost.Size;$maintenancePage.BackColor=[System.Drawing.Color]::Transparent
-$pageHost.Controls.AddRange(@($clickPage,$behaviorPage,$clickPointsPage,$appearancePage,$keybindPage,$processPage,$presetsPage,$maintenancePage))
-$form.Controls.Remove($settings); $form.Controls.Remove($monitor); $form.Controls.Remove($startButton); $form.Controls.Remove($stopButton); $form.Controls.Remove($advanced)
-$settings.Location=[System.Drawing.Point]::new(0,0); $monitor.Location=[System.Drawing.Point]::new(460,0); $monitor.Size=[System.Drawing.Size]::new(390,396)
-$clickPage.Controls.AddRange(@($settings,$monitor))
-$startButton.Location=[System.Drawing.Point]::new(0,420); $startButton.Size=[System.Drawing.Size]::new(442,54); $clickPage.Controls.Add($startButton)
-$stopButton.Location=[System.Drawing.Point]::new(460,420); $stopButton.Size=[System.Drawing.Size]::new(390,54); $clickPage.Controls.Add($stopButton)
-$script:footerLeft=New-Label 'TapForge  |  Runs locally on your PC' 4 490 380 22 8 $script:colorMuted; $clickPage.Controls.Add($script:footerLeft)
-$script:footerRight=New-Label 'F6 START/STOP    F7 EMERGENCY STOP' 460 490 350 22 8 $script:colorMuted $true; $clickPage.Controls.Add($script:footerRight)
-$advanced.Location=[System.Drawing.Point]::new(0,0); $advanced.Size=[System.Drawing.Size]::new(850,280); $behaviorPage.Controls.Add($advanced)
-$behaviorPage.AutoScroll=$false
-$behaviorExtras=New-Card 0 292 830 780;$behaviorPage.Controls.Add($behaviorExtras)
-$behaviorExtras.Controls.Add((New-Label 'Behavior and startup' 20 16 330 28 15 ([System.Drawing.Color]::White) $true))
-function Add-BehaviorToggle([string]$title,[string]$detail,[int]$y,[bool]$checked=$false){$behaviorExtras.Controls.Add((New-Label $title 20 $y 520 24 11 ([System.Drawing.Color]::White) $true));$behaviorExtras.Controls.Add((New-Label $detail 20 ($y+22) 640 22 9 $script:colorMuted));$cb=[TapForgeSwitch]::new();$cb.Location=[System.Drawing.Point]::new(754,$y+1);$cb.Checked=$checked;$cb.AccessibleName=$title;if(!$script:behaviorSwitches){$script:behaviorSwitches=[System.Collections.Generic.List[TapForgeSwitch]]::new()};$script:behaviorSwitches.Add($cb);$behaviorExtras.Controls.Add($cb);$cb}
-$script:alwaysTop=Add-BehaviorToggle 'Always on top' 'Keep TapForge above other windows.' 56 $false
-$script:stopAlert=Add-BehaviorToggle 'Stop reason alert' 'Show a notification when an automatic safety limit stops clicking.' 108 $true
-$script:strictHotkey=Add-BehaviorToggle 'Strict hotkey modifiers' 'Ignore the start shortcut while Ctrl, Shift, Alt, or Windows is held.' 188 $false
-$script:stopAltTab=Add-BehaviorToggle 'Stop on Alt+Tab' 'Stop clicking when switching to another window.' 240 $false
-$script:extendedSpeed=Add-BehaviorToggle 'Extended speed limit' 'Allow rates up to 1000 CPS; actual speed depends on Windows and the target app.' 292 $false
-$behaviorExtras.Controls.Add((New-Label 'Click point defaults' 20 352 330 26 12 ([System.Drawing.Color]::White) $true))
-$behaviorExtras.Controls.Add((New-Label 'Clicks per point' 20 388 250 24 10 $script:colorMuted));$script:pointDefaultClicks=[System.Windows.Forms.NumericUpDown]::new();$script:pointDefaultClicks.Location=[System.Drawing.Point]::new(700,384);$script:pointDefaultClicks.Size=[System.Drawing.Size]::new(90,28);$script:pointDefaultClicks.Minimum=1;$script:pointDefaultClicks.Maximum=9999;$script:pointDefaultClicks.Value=1;$behaviorExtras.Controls.Add($script:pointDefaultClicks)
-$behaviorExtras.Controls.Add((New-Label 'Randomization radius (pixels)' 20 430 300 24 10 $script:colorMuted));$script:pointDefaultRadius=[System.Windows.Forms.NumericUpDown]::new();$script:pointDefaultRadius.Location=[System.Drawing.Point]::new(700,426);$script:pointDefaultRadius.Size=[System.Drawing.Size]::new(90,28);$script:pointDefaultRadius.Minimum=0;$script:pointDefaultRadius.Maximum=1000;$script:pointDefaultRadius.Value=0;$behaviorExtras.Controls.Add($script:pointDefaultRadius)
-$behaviorExtras.Controls.Add((New-Label 'Startup' 20 476 330 26 12 ([System.Drawing.Color]::White) $true))
-$script:minimizeTray=Add-BehaviorToggle 'Minimize to tray' 'Close to the notification area instead of exiting.' 504 $false
-$script:rememberPosition=Add-BehaviorToggle 'Remember window position' 'Open the window at its last position.' 556 $true
-$script:runOnStartup=Add-BehaviorToggle 'Run on startup' 'Start TapForge when you sign in to Windows.' 608 $false
-$behaviorExtras.Controls.Add((New-Label 'Screen safety' 20 680 330 26 12 ([System.Drawing.Color]::White) $true))
-foreach($control in @($cornerStop,$cornerSize,$edgeStop,$edgeSize)){$advanced.Controls.Remove($control);$behaviorExtras.Controls.Add($control)}
-$cornerStop.Location=[System.Drawing.Point]::new(20,716);$cornerSize.Location=[System.Drawing.Point]::new(245,713);$edgeStop.Location=[System.Drawing.Point]::new(390,716);$edgeSize.Location=[System.Drawing.Point]::new(600,713)
-$script:extendedSpeed.Add_CheckedChanged({$rate.Maximum=if($script:extendedSpeed.Checked){1000}else{500};$quickRate.Maximum=$rate.Maximum;if($rate.Value -gt $rate.Maximum){$rate.Value=$rate.Maximum}})
-$script:alwaysTop.Add_CheckedChanged({$form.TopMost=$script:alwaysTop.Checked;if($script:pinButton){$script:pinButton.BackColor=if($script:alwaysTop.Checked){$script:colorAccent}else{Blend-Color $script:colorPanel $script:colorAccent 18}}})
-$script:runOnStartup.Add_CheckedChanged({try{$rk=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run',$true);if($script:runOnStartup.Checked){$rk.SetValue('TapForge','"'+(Join-Path $PSScriptRoot 'TapForge.exe')+'"')}else{$rk.DeleteValue('TapForge',$false)};$rk.Dispose()}catch{[System.Windows.Forms.MessageBox]::Show('Could not update the Windows startup setting.','TapForge')}})
-$clickPointsCard=New-Card 0 0 850 360;$clickPointsPage.Controls.Add($clickPointsCard)
-foreach($control in @($pointList,$pickPoint,$removePoint)){$advanced.Controls.Remove($control);$clickPointsCard.Controls.Add($control)}
-$clickPointsCard.Controls.Add((New-Label 'Click points' 22 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$clickPointsCard.Controls.Add((New-Label 'Pick screen locations to click in sequence. Each point uses the active click settings.' 22 50 790 24 9 $script:colorMuted))
-$script:pointsEnabled=[System.Windows.Forms.CheckBox]::new();$script:pointsEnabled.Text='Enable click points';$script:pointsEnabled.Location=[System.Drawing.Point]::new(600,22);$script:pointsEnabled.Size=[System.Drawing.Size]::new(190,28);$script:pointsEnabled.ForeColor=[System.Drawing.Color]::White;$clickPointsCard.Controls.Add($script:pointsEnabled)
-$script:stopWhenPointsDone=[System.Windows.Forms.CheckBox]::new();$script:stopWhenPointsDone.Text='Stop when complete';$script:stopWhenPointsDone.Location=[System.Drawing.Point]::new(570,210);$script:stopWhenPointsDone.Size=[System.Drawing.Size]::new(200,28);$script:stopWhenPointsDone.ForeColor=[System.Drawing.Color]::White;$clickPointsCard.Controls.Add($script:stopWhenPointsDone)
-$pointList.Location=[System.Drawing.Point]::new(22,100);$pointList.Size=[System.Drawing.Size]::new(520,220)
-$pickPoint.Location=[System.Drawing.Point]::new(570,100);$pickPoint.Size=[System.Drawing.Size]::new(180,38)
-$removePoint.Location=[System.Drawing.Point]::new(570,148);$removePoint.Size=[System.Drawing.Size]::new(180,38)
-$pageButtons=@{};$settingButtons=@{}
-function Show-Page([string]$name){
-    $script:currentPage=$name
-    if($script:appearanceMode -eq 'Individual page' -and $script:pageAccents.ContainsKey($name)){$script:colorAccent=$script:pageAccents[$name]}else{$script:colorAccent=$script:globalAccent}
-    $isSettings=($name -in @('Appearance','Keybinds','Process List','Presets','Maintenance'));$settingsBar.Visible=$isSettings;$contentWidth=[Math]::Max(700,$form.ClientSize.Width-32);$contentHeight=[Math]::Max(450,$form.ClientSize.Height-76);$settingsBar.Size=[System.Drawing.Size]::new(152,$contentHeight);$pageHost.Location=if($isSettings){[System.Drawing.Point]::new(184,52)}else{[System.Drawing.Point]::new(16,52)};$pageHost.Size=if($isSettings){[System.Drawing.Size]::new($contentWidth-168,$contentHeight)}else{[System.Drawing.Size]::new($contentWidth,$contentHeight)};foreach($p in $pageHost.Controls){$p.Size=$pageHost.Size}
-    if(!$isSettings){$leftWidth=[int](($pageHost.Width-18)/2);$settings.Width=$leftWidth;$monitor.Location=[System.Drawing.Point]::new($leftWidth+18,0);$monitor.Width=$pageHost.Width-$leftWidth-18;$startButton.Width=$leftWidth;$stopButton.Location=[System.Drawing.Point]::new($leftWidth+18,420);$stopButton.Width=$pageHost.Width-$leftWidth-18;$script:footerRight.Location=[System.Drawing.Point]::new($leftWidth+18,490);$script:footerRight.Width=$pageHost.Width-$leftWidth-18;$advanced.Width=$pageHost.Width;$behaviorExtras.Width=$pageHost.Width-20;$clickPointsCard.Width=$pageHost.Width};$processCard.Width=$pageHost.Width;$presetCard.Width=$pageHost.Width;$maintenanceCard.Width=$pageHost.Width
-    $behaviorPage.PerformLayout();if($script:behaviorScrollTrack){$script:behaviorScrollTrack.Location=[System.Drawing.Point]::new([Math]::Max(0,$behaviorPage.Width-8),0);$script:behaviorScrollTrack.Size=[System.Drawing.Size]::new(8,$behaviorPage.Height)};$behaviorContentWidth=[Math]::Max(700,$behaviorPage.ClientSize.Width-12);$advanced.Width=$behaviorContentWidth;$behaviorExtras.Width=[Math]::Max(680,$behaviorContentWidth-20);if($script:behaviorScrollTrack){Set-BehaviorScroll $script:behaviorScrollOffset}
-    $clickPage.Visible=($name -eq 'Clicking');$behaviorPage.Visible=($name -eq 'Behavior');if($script:behaviorScrollTrack){$script:behaviorScrollTrack.Visible=($name -eq 'Behavior')};$clickPointsPage.Visible=($name -eq 'Click Points');$appearancePage.Visible=($name -eq 'Appearance');$keybindPage.Visible=($name -eq 'Keybinds');$processPage.Visible=($name -eq 'Process List');$presetsPage.Visible=($name -eq 'Presets');$maintenancePage.Visible=($name -eq 'Maintenance')
-    foreach($key in $pageButtons.Keys){$pageButtons[$key].BackColor=if($key -eq $name){$script:colorAccent}else{Blend-Color $script:colorPanel $script:colorAccent 12};$pageButtons[$key].ForeColor=[System.Drawing.Color]::White}
-    foreach($key in $settingButtons.Keys){$settingButtons[$key].BackColor=if($key -eq $name){$script:colorAccent}else{Blend-Color $script:colorPanel $script:colorAccent 12};$settingButtons[$key].ForeColor=[System.Drawing.Color]::White}
-    Apply-Accent
-}
-$navIcons=@{Clicking='◉';Behavior='◌';'Click Points'='⊙'}
-foreach($page in @('Clicking','Behavior','Click Points')){$btn=New-Button $navIcons[$page] (48+($pageButtons.Count*38)) 6 32 32 ([System.Drawing.Color]::FromArgb(34,40,57)) ([System.Drawing.Color]::White);$btn.Font=[System.Drawing.Font]::new('Segoe UI Symbol',12,[System.Drawing.FontStyle]::Regular);$btn.Tag=$page;$btn.AccessibleName=$page;$navBar.Controls.Add($btn);$pageButtons[$page]=$btn;$btn.Add_Click({param($sender,$eventArgs) Show-Page $sender.Tag})}
-$gearButton=New-Button '⚙' 8 6 32 32 ([System.Drawing.Color]::FromArgb(34,40,57)) ([System.Drawing.Color]::White);$gearButton.Font=[System.Drawing.Font]::new('Segoe UI Symbol',12,[System.Drawing.FontStyle]::Regular);$gearButton.AccessibleName='Settings';$navBar.Controls.Add($gearButton);$gearButton.Add_Click({Show-Page 'Appearance'})
-$script:headerTips=[System.Windows.Forms.ToolTip]::new();$script:headerTips.SetToolTip($gearButton,'Settings');foreach($entry in $pageButtons.GetEnumerator()){$script:headerTips.SetToolTip($entry.Value,$entry.Value.AccessibleName)}
-$script:pinButton=New-Button '⌖' 0 6 30 32 ([System.Drawing.Color]::FromArgb(34,40,57)) ([System.Drawing.Color]::White);$script:pinButton.Font=[System.Drawing.Font]::new('Segoe UI Symbol',12);$script:pinButton.AccessibleName='Always on top';$script:pinButton.Tag='chrome';$navBar.Controls.Add($script:pinButton);$script:headerTips.SetToolTip($script:pinButton,'Always on top');$script:pinButton.Add_Click({$script:alwaysTop.Checked=!$script:alwaysTop.Checked})
-$script:windowMin=New-Button '—' 0 6 30 32 ([System.Drawing.Color]::FromArgb(22,22,22)) ([System.Drawing.Color]::White);$script:windowMin.Font=[System.Drawing.Font]::new('Segoe UI',11);$script:windowMin.Tag='chrome';$navBar.Controls.Add($script:windowMin);$script:headerTips.SetToolTip($script:windowMin,'Minimize');$script:windowMin.Add_Click({$form.WindowState=[System.Windows.Forms.FormWindowState]::Minimized})
-$script:windowMax=New-Button '□' 0 6 30 32 ([System.Drawing.Color]::FromArgb(22,22,22)) ([System.Drawing.Color]::White);$script:windowMax.Font=[System.Drawing.Font]::new('Segoe UI Symbol',10);$script:windowMax.Tag='chrome';$navBar.Controls.Add($script:windowMax);$script:headerTips.SetToolTip($script:windowMax,'Maximize');$script:windowMax.Add_Click({if($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Maximized){$form.WindowState=[System.Windows.Forms.FormWindowState]::Normal}else{$form.WindowState=[System.Windows.Forms.FormWindowState]::Maximized}})
-$script:windowClose=New-Button '×' 0 6 34 32 ([System.Drawing.Color]::FromArgb(22,22,22)) ([System.Drawing.Color]::White);$script:windowClose.Font=[System.Drawing.Font]::new('Segoe UI',15);$script:windowClose.Tag='chrome';$navBar.Controls.Add($script:windowClose);$script:headerTips.SetToolTip($script:windowClose,'Close');$script:windowClose.Add_Click({$form.Close()})
-$script:windowMin.FlatAppearance.MouseOverBackColor=[System.Drawing.Color]::FromArgb(55,55,55);$script:windowMax.FlatAppearance.MouseOverBackColor=[System.Drawing.Color]::FromArgb(55,55,55);$script:windowClose.FlatAppearance.MouseOverBackColor=[System.Drawing.Color]::FromArgb(190,45,55)
-$navBar.Add_Resize({$w=$navBar.ClientSize.Width;$brandX=[int](($w-160)/2);$brandMark.Location=[System.Drawing.Point]::new($brandX,6);$brandTitle.Location=[System.Drawing.Point]::new($brandX+40,7);$statusPill.Location=[System.Drawing.Point]::new([Math]::Max(520,$w-350),11);$script:pinButton.Location=[System.Drawing.Point]::new($w-246,6);if($script:compactButton){$script:compactButton.Location=[System.Drawing.Point]::new($w-208,6)};$script:windowMin.Location=[System.Drawing.Point]::new($w-132,6);$script:windowMax.Location=[System.Drawing.Point]::new($w-98,6);$script:windowClose.Location=[System.Drawing.Point]::new($w-64,6)})
-foreach($dragTarget in @($navBar,$brandMark,$brandTitle,$statusPill,$script:titleAccentLine)){$dragTarget.Add_MouseDown({param($s,$e)if($e.Button -eq [System.Windows.Forms.MouseButtons]::Left){[TapForgeWindow]::BeginDrag($form.Handle)}})}
-foreach($entry in @(@('Appearance','☼','Appearance'),@('Keybinds','⌘','Keybinds'),@('Process List','▤','Process List'),@('Presets','◆','Presets'),@('Maintenance','⚒','Maintenance'))){$page=$entry[0];$caption="$($entry[1])   $($entry[2])";$btn=New-Button $caption 8 (36+($settingButtons.Count*48)) 136 40 ([System.Drawing.Color]::FromArgb(34,40,57)) ([System.Drawing.Color]::White);$btn.Tag=$page;$settingsBar.Controls.Add($btn);$settingButtons[$page]=$btn;$btn.Add_Click({param($sender,$eventArgs) Show-Page $sender.Tag})}
-$processCard=New-Card 0 0 830 540;$processPage.Controls.Add($processCard)
-$processCard.Controls.Add((New-Label 'Process list' 20 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$processCard.Controls.Add((New-Label 'Optionally restrict clicks to one foreground application.' 20 50 700 24 9 $script:colorMuted))
-$processList=[System.Windows.Forms.ListBox]::new();$processList.Location=[System.Drawing.Point]::new(20,96);$processList.Size=[System.Drawing.Size]::new(550,360);$processList.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$processList.ForeColor=[System.Drawing.Color]::White;$processCard.Controls.Add($processList)
-$refreshProcesses=New-Button 'Refresh' 600 96 170 36 $script:colorAccent ([System.Drawing.Color]::White);$processCard.Controls.Add($refreshProcesses)
-$script:filterProcess=[System.Windows.Forms.CheckBox]::new();$script:filterProcess.Text='Only click while selected app is active';$script:filterProcess.Location=[System.Drawing.Point]::new(600,150);$script:filterProcess.Size=[System.Drawing.Size]::new(210,48);$script:filterProcess.ForeColor=[System.Drawing.Color]::White;$processCard.Controls.Add($script:filterProcess)
-$script:processIds=[System.Collections.Generic.List[int]]::new();$refreshProcesses.Add_Click({$processList.Items.Clear();$script:processIds.Clear();foreach($p in [System.Diagnostics.Process]::GetProcesses()|Where-Object {$_.MainWindowTitle}|Sort-Object MainWindowTitle){[void]$processList.Items.Add(('{0}  (PID {1})' -f $p.MainWindowTitle,$p.Id));$script:processIds.Add($p.Id)}})
-$refreshProcesses.PerformClick()
-$keybindCard=New-Card 0 0 830 430;$keybindPage.Controls.Add($keybindCard)
-$keybindCard.Controls.Add((New-Label 'Keybinds' 20 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$keybindCard.Controls.Add((New-Label 'Set the global start/stop and emergency stop keys.' 20 50 700 24 9 $script:colorMuted))
-$keybindCard.Controls.Add((New-Label 'Start / stop clicking' 20 104 400 28 12 ([System.Drawing.Color]::White) $true));$startKeyHint=New-Label 'Global shortcut · works while TapForge is minimized.' 20 132 520 22 9 $script:colorMuted;$keybindCard.Controls.Add($startKeyHint)
-$startKeyOnKeybind=[System.Windows.Forms.ComboBox]::new();$startKeyOnKeybind.Location=[System.Drawing.Point]::new(600,104);$startKeyOnKeybind.Size=[System.Drawing.Size]::new(170,34);$startKeyOnKeybind.DropDownStyle='DropDownList';[void]$startKeyOnKeybind.Items.AddRange(@('F6','F8','F9','F10','F11','F12'));$startKeyOnKeybind.SelectedItem=$keyPick.SelectedItem;$keybindCard.Controls.Add($startKeyOnKeybind)
-$keybindCard.Controls.Add((New-Label 'Emergency stop' 20 200 400 28 12 ([System.Drawing.Color]::White) $true));$keybindCard.Controls.Add((New-Label 'Always stops the click engine immediately.' 20 228 520 22 9 $script:colorMuted))
-$script:emergencyKey=[System.Windows.Forms.ComboBox]::new();$script:emergencyKey.Location=[System.Drawing.Point]::new(600,200);$script:emergencyKey.Size=[System.Drawing.Size]::new(170,34);$script:emergencyKey.DropDownStyle='DropDownList';[void]$script:emergencyKey.Items.AddRange(@('F7','F8','F9','F10','F11','F12'));$script:emergencyKey.SelectedIndex=0;$keybindCard.Controls.Add($script:emergencyKey)
-$script:syncingKeys=$false
-$keyPick.Add_SelectedIndexChanged({if(!$script:syncingKeys -and $null -ne $startKeyOnKeybind){$script:syncingKeys=$true;$startKeyOnKeybind.SelectedItem=$keyPick.SelectedItem;if($script:emergencyKey.SelectedItem -eq $keyPick.SelectedItem){$script:emergencyKey.SelectedIndex=0};$script:syncingKeys=$false}})
-$startKeyOnKeybind.Add_SelectedIndexChanged({if(!$script:syncingKeys -and $null -ne $startKeyOnKeybind.SelectedItem){$script:syncingKeys=$true;$keyPick.SelectedItem=$startKeyOnKeybind.SelectedItem;$script:syncingKeys=$false}})
-$script:emergencyKey.Add_SelectedIndexChanged({if(!$script:syncingKeys -and $script:emergencyKey.SelectedItem -eq $keyPick.SelectedItem){$script:syncingKeys=$true;$keyPick.SelectedItem='F6';$startKeyOnKeybind.SelectedItem='F6';$script:syncingKeys=$false}})
-$keybindCard.Controls.Add((New-Label 'Use Behavior to choose toggle or hold mode.' 20 300 740 44 9 $script:colorMuted))
-$presetCard=New-Card 0 0 830 540;$presetsPage.Controls.Add($presetCard)
-$presetCard.Controls.Add((New-Label 'Presets' 20 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$presetCard.Controls.Add((New-Label 'Save and restore your click settings.' 20 50 700 24 9 $script:colorMuted))
-$script:presetName=[System.Windows.Forms.TextBox]::new();$script:presetName.Location=[System.Drawing.Point]::new(20,96);$script:presetName.Size=[System.Drawing.Size]::new(400,34);$presetCard.Controls.Add($script:presetName)
-$presetList=[System.Windows.Forms.ListBox]::new();$presetList.Location=[System.Drawing.Point]::new(20,150);$presetList.Size=[System.Drawing.Size]::new(540,330);$presetList.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$presetList.ForeColor=[System.Drawing.Color]::White;$presetCard.Controls.Add($presetList)
-$presetSave=New-Button 'Save current' 600 96 170 36 $script:colorAccent ([System.Drawing.Color]::White);$presetLoad=New-Button 'Load selected' 600 150 170 36 $script:colorAccent ([System.Drawing.Color]::White);$presetDelete=New-Button 'Delete selected' 600 204 170 36 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$presetCard.Controls.AddRange(@($presetSave,$presetLoad,$presetDelete))
-$script:presetDirectory=Join-Path $env:LOCALAPPDATA 'TapForge\Presets';[void](New-Item -ItemType Directory -Force -Path $script:presetDirectory)
-function Refresh-Presets {$presetList.Items.Clear();foreach($f in Get-ChildItem -LiteralPath $script:presetDirectory -Filter '*.json' -ErrorAction SilentlyContinue){[void]$presetList.Items.Add([System.IO.Path]::GetFileNameWithoutExtension($f.Name))}}
-$presetSave.Add_Click({$name=($script:presetName.Text -replace '[^a-zA-Z0-9 _-]','').Trim();if(!$name){[System.Windows.Forms.MessageBox]::Show('Enter a preset name first.','TapForge');return};$data=@{intervalMs=(Get-IntervalMilliseconds);interval=[int]$interval.Value;intervalUnit=$intervalUnit.SelectedIndex;button=$buttonPick.SelectedIndex;stopMode=$modePick.SelectedIndex;limit=[long]$limit.Value;speedMode=$speedMode.SelectedIndex;rate=[int]$rate.Value;extended=$script:extendedSpeed.Checked;hotkey=$keyPick.SelectedItem.ToString();hotkeyMode=$hotkeyMode.SelectedIndex;keyboard=$keyboardMode.Checked;keyCode=$keyCodePick.SelectedIndex;double=$doubleClick.Checked;duty=[int]$duty.Value;random=[int]$randomize.Value;corners=$cornerStop.Checked;cornerSize=[int]$cornerSize.Value;edges=$edgeStop.Checked;edgeSize=[int]$edgeSize.Value};$data|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $script:presetDirectory ($name+'.json')) -Encoding UTF8;Refresh-Presets})
-$presetLoad.Add_Click({if($presetList.SelectedItem){$d=Get-Content -LiteralPath (Join-Path $script:presetDirectory ($presetList.SelectedItem+'.json')) -Raw|ConvertFrom-Json;$script:extendedSpeed.Checked=[bool]$d.extended;if($d.PSObject.Properties['intervalMs']){$intervalUnit.SelectedIndex=if($d.PSObject.Properties['intervalUnit']){[int]$d.intervalUnit}else{0};Set-IntervalMilliseconds ([long]$d.intervalMs)}else{$intervalUnit.SelectedIndex=0;$SetOldInterval=[decimal]$d.interval;$interval.Value=[Math]::Min($interval.Maximum,[Math]::Max($interval.Minimum,$SetOldInterval))};$buttonPick.SelectedIndex=[int]$d.button;$modePick.SelectedIndex=[int]$d.stopMode;$limit.Value=[decimal]$d.limit;$speedMode.SelectedIndex=[int]$d.speedMode;$rate.Value=[decimal]$d.rate;$keyPick.SelectedItem=[string]$d.hotkey;$hotkeyMode.SelectedIndex=[int]$d.hotkeyMode;$keyboardMode.Checked=[bool]$d.keyboard;$keyCodePick.SelectedIndex=[int]$d.keyCode;$doubleClick.Checked=[bool]$d.double;$duty.Value=[decimal]$d.duty;$randomize.Value=[decimal]$d.random;$cornerStop.Checked=[bool]$d.corners;$cornerSize.Value=[decimal]$d.cornerSize;$edgeStop.Checked=[bool]$d.edges;$edgeSize.Value=[decimal]$d.edgeSize}})
-$presetDelete.Add_Click({if($presetList.SelectedItem){Remove-Item -LiteralPath (Join-Path $script:presetDirectory ($presetList.SelectedItem+'.json')) -Force;Refresh-Presets}});Refresh-Presets
-$maintenanceCard=New-Card 0 0 830 390;$maintenancePage.Controls.Add($maintenanceCard)
-$maintenanceCard.Controls.Add((New-Label 'Maintenance' 20 18 300 30 16 ([System.Drawing.Color]::White) $true))
-$maintenanceCard.Controls.Add((New-Label 'Manage settings, diagnostics, and TapForge updates.' 20 50 700 24 9 $script:colorMuted))
-$resetSettings=New-Button 'Reset all settings' 20 104 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$openDiagnostics=New-Button 'Open diagnostics folder' 220 104 200 38 $script:colorAccent ([System.Drawing.Color]::White);$exportDiagnostics=New-Button 'Export diagnostics' 440 104 180 38 $script:colorAccent ([System.Drawing.Color]::White);$resetUsage=New-Button 'Reset usage data' 20 160 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$maintenanceCard.Controls.AddRange(@($resetSettings,$openDiagnostics,$exportDiagnostics,$resetUsage))
-$script:checkUpdateButton=New-Button 'Check for updates' 220 160 180 38 $script:colorAccent ([System.Drawing.Color]::White);$maintenanceCard.Controls.Add($script:checkUpdateButton)
-$script:publishUpdateButton=New-Button 'Publish update' 420 160 180 38 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$script:publishUpdateButton.Visible=(Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Publish-TapForgeUpdate.ps1'));$maintenanceCard.Controls.Add($script:publishUpdateButton)
-$script:updateStatus=New-Label 'Current version: loading…' 20 218 720 24 9 $script:colorMuted;$maintenanceCard.Controls.Add($script:updateStatus)
-$script:versionFile=Join-Path $PSScriptRoot 'VERSION';$script:appVersion='3.9.6';if(Test-Path -LiteralPath $script:versionFile){try{$script:appVersion=(Get-Content -LiteralPath $script:versionFile -Raw).Trim()}catch{}}
-$script:updateStatus.Text="Current version: $($script:appVersion)"
-$script:diagnosticsDirectory=Join-Path $env:LOCALAPPDATA 'TapForge\Diagnostics';[void](New-Item -ItemType Directory -Force -Path $script:diagnosticsDirectory)
-$openDiagnostics.Add_Click({Start-Process explorer.exe -ArgumentList ('"'+$script:diagnosticsDirectory+'"')})
-$exportDiagnostics.Add_Click({$dlg=[System.Windows.Forms.SaveFileDialog]::new();$dlg.Filter='JSON report|*.json';$dlg.FileName='TapForge-diagnostics.json';if($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK){@{app='TapForge';created=(Get-Date).ToString('o');windows=[Environment]::OSVersion.Version.ToString();powershell=$PSVersionTable.PSVersion.ToString();clicks=$script:clickCount;clickEngine='Native high-resolution worker'}|ConvertTo-Json|Set-Content -LiteralPath $dlg.FileName -Encoding UTF8};$dlg.Dispose()})
-$resetUsage.Add_Click({$script:clickCount=0;$countLabel.Text='0';$script:stopwatch.Reset();$elapsedLabel.Text='00:00:00'})
-function Get-TapForgeLatestRelease {
-    [System.Net.ServicePointManager]::SecurityProtocol=[System.Net.SecurityProtocolType]::Tls12
-    $request=[System.Net.HttpWebRequest]::Create('https://api.github.com/repos/saberapexyt-commits/TapForge/releases/latest')
-    $request.Method='GET';$request.UserAgent='TapForge-Updater';$request.Accept='application/vnd.github+json';$request.Timeout=7000;$request.ReadWriteTimeout=7000
-    $response=$null;$reader=$null
-    try{$response=$request.GetResponse();$reader=[System.IO.StreamReader]::new($response.GetResponseStream());$json=$reader.ReadToEnd();ConvertFrom-Json -InputObject $json}
-    finally{if($reader){$reader.Dispose()};if($response){$response.Dispose()}}
-}
-function Install-TapForgeRelease($release) {
-    $tag=[string]$release.tag_name;$assetName="TapForge-$tag-Portable.zip";$asset=@($release.assets|Where-Object{$_.name -eq $assetName}|Select-Object -First 1)
-    if(!$tag -or !$asset){[System.Windows.Forms.MessageBox]::Show("The $tag release does not contain its portable app ZIP.",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning)|Out-Null;return}
-    $target=$PSScriptRoot;$updates=Join-Path $env:LOCALAPPDATA 'TapForge\Updates';$stage=Join-Path $updates ([guid]::NewGuid().ToString('N'));$zip=Join-Path $updates $assetName
-    try{
-        [void](New-Item -ItemType Directory -Force -Path $stage)
-        $request=[System.Net.HttpWebRequest]::Create([string]$asset.browser_download_url);$request.Method='GET';$request.UserAgent='TapForge-Updater';$request.Timeout=30000;$request.ReadWriteTimeout=30000
-        $response=$request.GetResponse();try{$inputStream=$response.GetResponseStream();$file=[System.IO.File]::Open($zip,[System.IO.FileMode]::Create,[System.IO.FileAccess]::Write);try{$inputStream.CopyTo($file)}finally{$file.Dispose();$inputStream.Dispose()}}finally{$response.Dispose()}
-        if($asset.digest -and ([string]$asset.digest -match '^sha256:([0-9a-fA-F]{64})$')){$expected=$Matches[1];$actual=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash;if($actual -ne $expected){throw 'The downloaded update did not pass its SHA-256 check.'}}
-        Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
-        foreach($required in @('TapForge.exe','AutoClicker.ps1','TapForge.ico','TapForgeLogo.png','VERSION')){if(!(Test-Path -LiteralPath (Join-Path $stage $required))){throw "The update package is missing $required."}}
-        $probe=Join-Path $target '.tapforge-update-check';Set-Content -LiteralPath $probe -Value 'ok' -Encoding ascii;Remove-Item -LiteralPath $probe -Force
-        $helper=Join-Path $updates 'Apply-TapForgeUpdate.ps1'
-        @'
-param([string]$TargetDir,[string]$StageDir,[int]$WaitPid)
-$ErrorActionPreference='Stop'
-for($i=0;$i -lt 120;$i++){if(!(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}
-if(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue){exit 2}
-foreach($name in @('TapForge.exe','AutoClicker.ps1','TapForge.ico','TapForgeLogo.png','VERSION','README.txt','Launch AutoClicker.bat')){$from=Join-Path $StageDir $name;if(Test-Path -LiteralPath $from){Copy-Item -LiteralPath $from -Destination (Join-Path $TargetDir $name) -Force}}
-Start-Process -FilePath (Join-Path $TargetDir 'TapForge.exe') -WorkingDirectory $TargetDir
-'@ | Set-Content -LiteralPath $helper -Encoding UTF8
-        $args="-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$helper`" -TargetDir `"$target`" -StageDir `"$stage`" -WaitPid $PID"
-        Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $args -WindowStyle Hidden
-        $script:exitRequested=$true;$form.Close()
-    }catch{[System.Windows.Forms.MessageBox]::Show("TapForge could not install the update.`r`n`r`n$($_.Exception.Message)",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error)|Out-Null;if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue}}
-}
-$script:updateWorker=[System.ComponentModel.BackgroundWorker]::new();$script:updateWorker.WorkerSupportsCancellation=$false
-$script:updateWorker.Add_DoWork({param($sender,$e)try{$e.Result=@{Release=(Get-TapForgeLatestRelease);Automatic=[bool]$e.Argument;Error=$null}}catch{$e.Result=@{Release=$null;Automatic=[bool]$e.Argument;Error=$_.Exception.Message}}})
-$script:updateWorker.Add_RunWorkerCompleted({param($sender,$e)$result=$e.Result;if($e.Error){$script:updateStatus.Text='Could not check for updates.';if(!$script:updateCheckAutomatic){[System.Windows.Forms.MessageBox]::Show("Could not check for updates.`r`n`r`n$($e.Error.Message)",'TapForge update')|Out-Null};return};if($result.Error){$script:updateStatus.Text='Could not check for updates.';if(!$result.Automatic){[System.Windows.Forms.MessageBox]::Show("Could not check for updates.`r`n`r`n$($result.Error)",'TapForge update')|Out-Null};return};$release=$result.Release;$available=try{([version]([string]$release.tag_name -replace '^v','')) -gt ([version]$script:appVersion)}catch{$false};if(!$available){$script:updateStatus.Text="You're up to date (v$($script:appVersion)).";if(!$result.Automatic){[System.Windows.Forms.MessageBox]::Show("TapForge v$($script:appVersion) is up to date.",'TapForge update')|Out-Null};return};$script:updateStatus.Text="Update available: $($release.tag_name)";$choice=[System.Windows.Forms.MessageBox]::Show("TapForge $($release.tag_name) is available. Download and install it now?`r`n`r`nTapForge will close and reopen after the update.",'TapForge update',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Information);if($choice -eq [System.Windows.Forms.DialogResult]::Yes){Install-TapForgeRelease $release}})
-$script:updateCheckAutomatic=$false
-$script:checkForTapForgeUpdate={param([bool]$automatic=$false)if($script:updateWorker.IsBusy){return};$script:updateCheckAutomatic=$automatic;$script:updateStatus.Text='Checking for updates…';$script:updateWorker.RunWorkerAsync($automatic)}
-$script:checkUpdateButton.Add_Click({& $script:checkForTapForgeUpdate $false})
-$script:publishUpdateButton.Add_Click({$v=[version]$script:appVersion;$next="$($v.Major).$($v.Minor).$($v.Build+1)";$answer=[Microsoft.VisualBasic.Interaction]::InputBox('Enter the version to publish (for example, '+$next+').','Publish TapForge update',$next);if(!$answer){return};if($answer -notmatch '^\d+\.\d+\.\d+$'){[System.Windows.Forms.MessageBox]::Show('Use a version in major.minor.patch format.','Publish TapForge update')|Out-Null;return};$publisher=Join-Path $PSScriptRoot 'Publish-TapForgeUpdate.ps1';$args="-NoProfile -ExecutionPolicy Bypass -File `"$publisher`" -Version `"$answer`"";Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $args -WorkingDirectory $PSScriptRoot})
-$resetSettings.Add_Click({if([System.Windows.Forms.MessageBox]::Show('Reset TapForge settings to their defaults?','TapForge',[System.Windows.Forms.MessageBoxButtons]::YesNo,[System.Windows.Forms.MessageBoxIcon]::Question) -eq [System.Windows.Forms.DialogResult]::Yes){$themePick.SelectedIndex=0;$appearanceModePick.SelectedIndex=0;$script:globalAccent=[System.Drawing.Color]::FromArgb(123,97,255);foreach($k in $script:pageAccents.Keys){$script:pageAccents[$k]=$script:globalAccent};$intervalUnit.SelectedIndex=0;Set-IntervalMilliseconds 100;$buttonPick.SelectedIndex=0;$modePick.SelectedIndex=0;$limit.Value=100;$speedMode.SelectedIndex=0;$rate.Value=10;$keyPick.SelectedIndex=0;$hotkeyMode.SelectedIndex=0;$keyboardMode.Checked=$false;$doubleClick.Checked=$false;$duty.Value=0;$randomize.Value=0;$cornerStop.Checked=$false;$edgeStop.Checked=$false;$script:alwaysTop.Checked=$false;$script:stopAlert.Checked=$true;$script:strictHotkey.Checked=$false;$script:stopAltTab.Checked=$false;$script:extendedSpeed.Checked=$false;$script:minimizeTray.Checked=$false;$script:rememberPosition.Checked=$true;$script:runOnStartup.Checked=$false;$script:pointDefaultClicks.Value=1;$script:pointDefaultRadius.Value=0;$script:pointsEnabled.Checked=$false;$script:stopWhenPointsDone.Checked=$false;$script:points.Clear();$pointList.Items.Clear();Apply-Theme}})
-$script:globalAccent=$script:colorAccent;$script:pageAccents=@{Clicking=$script:colorAccent;Behavior=$script:colorAccent;Appearance=$script:colorAccent;'Click Points'=$script:colorAccent;Keybinds=$script:colorAccent;'Process List'=$script:colorAccent;Presets=$script:colorAccent;Maintenance=$script:colorAccent};$script:appearanceMode='Global';$script:lightTheme=$false;$script:panelOpacity=100
-$appearanceCard=New-Card 0 0 830 490; $appearanceCard.Location=[System.Drawing.Point]::new(0,0);$appearancePage.Controls.Add($appearanceCard)
-$appearanceCard.Controls.Add((New-Label 'Appearance' 22 18 300 30 17 ([System.Drawing.Color]::White) $true))
-$appearanceCard.Controls.Add((New-Label 'Choose a theme and accent hue.' 22 50 600 20 9 $script:colorMuted))
-$script:themeSection=New-Card 10 74 810 156;$appearanceCard.Controls.Add($script:themeSection)
-$script:iconSection=New-Card 10 238 810 240;$appearanceCard.Controls.Add($script:iconSection)
-$appearanceCard.Controls.Add((New-Label 'THEME' 22 88 140 18 8 $script:colorMuted $true))
-$themePick=[System.Windows.Forms.ComboBox]::new();$themePick.Location=[System.Drawing.Point]::new(22,110);$themePick.Size=[System.Drawing.Size]::new(220,32);$themePick.DropDownStyle='DropDownList';[void]$themePick.Items.AddRange(@('Dark','Light'));$themePick.SelectedIndex=0;$appearanceCard.Controls.Add($themePick)
-$appearanceCard.Controls.Add((New-Label 'APPEARANCE MODE' 280 88 180 18 8 $script:colorMuted $true))
-$appearanceModePick=[System.Windows.Forms.ComboBox]::new();$appearanceModePick.Location=[System.Drawing.Point]::new(280,110);$appearanceModePick.Size=[System.Drawing.Size]::new(220,32);$appearanceModePick.DropDownStyle='DropDownList';[void]$appearanceModePick.Items.AddRange(@('Global','Individual page'));$appearanceModePick.SelectedIndex=0;$appearanceCard.Controls.Add($appearanceModePick)
-$appearanceCard.Controls.Add((New-Label 'EDIT PAGE' 530 88 180 18 8 $script:colorMuted $true))
-$script:accentTarget=[System.Windows.Forms.ComboBox]::new();$script:accentTarget.Location=[System.Drawing.Point]::new(530,110);$script:accentTarget.Size=[System.Drawing.Size]::new(220,32);$script:accentTarget.DropDownStyle='DropDownList';[void]$script:accentTarget.Items.AddRange(@('Clicking','Behavior','Click Points','Appearance','Keybinds','Process List','Presets','Maintenance'));$script:accentTarget.SelectedIndex=0;$appearanceCard.Controls.Add($script:accentTarget)
-$appearanceCard.Controls.Add((New-Label 'ACCENT HUE' 22 164 180 18 8 $script:colorMuted $true))
-$script:accentSwatch=[System.Windows.Forms.Panel]::new();$script:accentSwatch.Location=[System.Drawing.Point]::new(22,188);$script:accentSwatch.Size=[System.Drawing.Size]::new(52,36);$script:accentSwatch.BackColor=$script:colorAccent;$appearanceCard.Controls.Add($script:accentSwatch)
-$script:accentHex=New-Label '#7B61FF' 88 192 110 28 11 ([System.Drawing.Color]::White) $true;$appearanceCard.Controls.Add($script:accentHex)
-$script:hueButton=New-Button 'Open hue picker' 280 188 220 36 $script:colorAccent ([System.Drawing.Color]::White);$script:hueButton.Tag='primary';$appearanceCard.Controls.Add($script:hueButton)
-$appearanceCard.Controls.Add((New-Label 'TASKBAR ICON' 22 258 180 18 8 $script:colorMuted $true))
-$script:activeIcon=[System.Windows.Forms.CheckBox]::new();$script:activeIcon.Text='Show active state in the taskbar icon';$script:activeIcon.Location=[System.Drawing.Point]::new(22,284);$script:activeIcon.Size=[System.Drawing.Size]::new(300,25);$script:activeIcon.Checked=$true;$appearanceCard.Controls.Add($script:activeIcon)
-$script:iconTheme=[System.Windows.Forms.ComboBox]::new();$script:iconTheme.Location=[System.Drawing.Point]::new(350,280);$script:iconTheme.Size=[System.Drawing.Size]::new(180,30);$script:iconTheme.DropDownStyle='DropDownList';[void]$script:iconTheme.Items.AddRange(@('Auto','Dark','Light'));$script:iconTheme.SelectedIndex=0;$appearanceCard.Controls.Add($script:iconTheme)
-$appearanceCard.Controls.Add((New-Label 'ICON COLOR' 22 334 140 18 8 $script:colorMuted $true))
-$script:iconColor=[System.Windows.Forms.ComboBox]::new();$script:iconColor.Location=[System.Drawing.Point]::new(22,358);$script:iconColor.Size=[System.Drawing.Size]::new(220,30);$script:iconColor.DropDownStyle='DropDownList';[void]$script:iconColor.Items.Add('User-provided TapForge logo');$script:iconColor.SelectedIndex=0;$appearanceCard.Controls.Add($script:iconColor)
-$script:footerToggle=[System.Windows.Forms.CheckBox]::new();$script:footerToggle.Text='Show status footer';$script:footerToggle.Location=[System.Drawing.Point]::new(22,422);$script:footerToggle.Size=[System.Drawing.Size]::new(250,25);$script:footerToggle.Checked=$true;$appearanceCard.Controls.Add($script:footerToggle)
-$script:themeSection.SendToBack();$script:iconSection.SendToBack()
-foreach($c in $appearanceCard.Controls){if($c -is [System.Windows.Forms.ComboBox]){$c.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$c.ForeColor=[System.Drawing.Color]::White;$c.FlatStyle='Flat'}elseif($c -is [System.Windows.Forms.TextBox]){$c.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$c.ForeColor=[System.Drawing.Color]::White;$c.BorderStyle='FixedSingle'}elseif($c -is [AccentSlider]){$c.BackColor=$script:colorPanel}elseif($c -is [System.Windows.Forms.CheckBox]){$c.BackColor=$script:colorPanel;$c.ForeColor=[System.Drawing.Color]::White}}
-function Enable-AccentCombo([System.Windows.Forms.ComboBox]$combo){if($combo.Tag -eq 'accent-drawn') {return};$combo.Tag='accent-drawn';$combo.DrawMode='OwnerDrawFixed';$combo.ItemHeight=24;$combo.FlatStyle='Flat';$combo.Add_DrawItem({param($s,$e)$idx=if($e.Index -ge 0){$e.Index}else{$s.SelectedIndex};$chosen=($e.Index -lt 0) -or (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0);$base=if($script:lightTheme){[System.Drawing.Color]::FromArgb(250,251,253)}else{[System.Drawing.Color]::FromArgb(34,40,57)};$fill=if($chosen){$script:comboAccent}else{Blend-Color $base $script:comboAccent 12};$inkColor=if($script:lightTheme -and !$chosen){[System.Drawing.Color]::FromArgb(28,32,43)}else{[System.Drawing.Color]::White};$brush=[System.Drawing.SolidBrush]::new($fill);$ink=[System.Drawing.SolidBrush]::new($inkColor);$e.Graphics.FillRectangle($brush,$e.Bounds);$brush.Dispose();if($idx -ge 0 -and $idx -lt $s.Items.Count){$e.Graphics.DrawString($s.Items[$idx].ToString(),$s.Font,$ink,$e.Bounds.X+5,$e.Bounds.Y+4)};$ink.Dispose();$e.DrawFocusRectangle()});if(!$script:accentCombos){$script:accentCombos=[System.Collections.Generic.List[System.Windows.Forms.ComboBox]]::new()};$script:accentCombos.Add($combo);$arrow=[AccentArrow]::new();$arrow.Size=[System.Drawing.Size]::new(18,[Math]::Max(20,$combo.Height-2));$arrow.Location=[System.Drawing.Point]::new($combo.Right-19,$combo.Top+1);$combo.Parent.Controls.Add($arrow);$arrow.BringToFront();$script:accentArrows.Add($arrow);$target=$combo;$overlay=$arrow;$arrow.Add_Click({$target.DroppedDown=!$target.DroppedDown}.GetNewClosure());$combo.Add_LocationChanged({$overlay.Location=[System.Drawing.Point]::new($target.Right-19,$target.Top+1)}.GetNewClosure());$combo.Add_SizeChanged({$overlay.Location=[System.Drawing.Point]::new($target.Right-19,$target.Top+1);$overlay.Height=[Math]::Max(20,$target.Height-2)}.GetNewClosure())}
-$script:accentCombos=[System.Collections.Generic.List[System.Windows.Forms.ComboBox]]::new();$script:accentArrows=[System.Collections.Generic.List[AccentArrow]]::new();$script:accentSpinners=[System.Collections.Generic.List[AccentSpinner]]::new();$script:accentFrames=[System.Collections.Generic.List[AccentFrameLine]]::new()
-function Add-AccentFrame($control){$parent=$control.Parent;$lines=@();$top=[AccentFrameLine]::new();$bottom=[AccentFrameLine]::new();$left=[AccentFrameLine]::new();$right=[AccentFrameLine]::new();foreach($line in @($top,$bottom,$left,$right)){$parent.Controls.Add($line);$line.BringToFront();$script:accentFrames.Add($line);$lines+=,$line};$update={ $top.Location=[System.Drawing.Point]::new($control.Left,$control.Top);$top.Size=[System.Drawing.Size]::new($control.Width,1);$bottom.Location=[System.Drawing.Point]::new($control.Left,$control.Bottom-1);$bottom.Size=[System.Drawing.Size]::new($control.Width,1);$left.Location=[System.Drawing.Point]::new($control.Left,$control.Top+1);$left.Size=[System.Drawing.Size]::new(1,[Math]::Max(1,$control.Height-2));$right.Location=[System.Drawing.Point]::new($control.Right-1,$control.Top+1);$right.Size=[System.Drawing.Size]::new(1,[Math]::Max(1,$control.Height-2))}.GetNewClosure();$control.Add_LocationChanged($update);$control.Add_SizeChanged($update);& $update}
-function Add-AccentSpinner([System.Windows.Forms.NumericUpDown]$control){$control.BorderStyle='None';$spinner=[AccentSpinner]::new($control);$spinner.Size=[System.Drawing.Size]::new(18,$control.Height);$spinner.Location=[System.Drawing.Point]::new($control.Right-18,$control.Top);$control.Parent.Controls.Add($spinner);$spinner.BringToFront();$script:accentSpinners.Add($spinner);$target=$control;$overlay=$spinner;$control.Add_LocationChanged({$overlay.Location=[System.Drawing.Point]::new($target.Right-18,$target.Top)}.GetNewClosure());$control.Add_SizeChanged({$overlay.Location=[System.Drawing.Point]::new($target.Right-18,$target.Top);$overlay.Height=$target.Height}.GetNewClosure())}
-$pending=[System.Collections.Generic.Stack[System.Windows.Forms.Control]]::new();$pending.Push($form);while($pending.Count -gt 0){$node=$pending.Pop();if($node -is [System.Windows.Forms.ComboBox]){Enable-AccentCombo $node;Add-AccentFrame $node}elseif($node -is [System.Windows.Forms.NumericUpDown]){Add-AccentSpinner $node;Add-AccentFrame $node}elseif($node -is [System.Windows.Forms.TextBox]){$node.BorderStyle='None';Add-AccentFrame $node};foreach($child in $node.Controls){$pending.Push($child)}}
-function Blend-Color([System.Drawing.Color]$a,[System.Drawing.Color]$b,[int]$percent){$t=[Math]::Max(0,[Math]::Min(100,$percent))/100.0;[System.Drawing.Color]::FromArgb([int]($a.R*(1-$t)+$b.R*$t),[int]($a.G*(1-$t)+$b.G*$t),[int]($a.B*(1-$t)+$b.B*$t))}
-function Enable-DarkChrome([System.Windows.Forms.Form]$window){[ClickNative]::ApplyDarkTitle($window.Handle);$pending=[System.Collections.Generic.Stack[System.Windows.Forms.Control]]::new();$pending.Push($window);while($pending.Count -gt 0){$control=$pending.Pop();foreach($child in $control.Controls){$pending.Push($child)};if($control -is [System.Windows.Forms.ComboBox] -or $control -is [System.Windows.Forms.NumericUpDown] -or $control -is [System.Windows.Forms.ListBox] -or $control -is [System.Windows.Forms.TextBox]){[ClickNative]::ApplyDarkControl($control.Handle)}}}
-function Apply-Accent {
-    if($script:appearanceMode -eq 'Global'){$script:colorAccent=$script:globalAccent}elseif($script:pageAccents.ContainsKey($script:currentPage)){$script:colorAccent=$script:pageAccents[$script:currentPage]}else{$script:colorAccent=$script:globalAccent}
-    if($script:titleAccentLine){$script:titleAccentLine.BackColor=$script:colorAccent}
-    $accentPage=$script:accentTarget.SelectedItem.ToString();$displayAccent=if($script:appearanceMode -eq 'Individual page' -and $script:currentPage -eq 'Appearance'){$script:pageAccents[$accentPage]}else{$script:colorAccent};$script:comboAccent=$displayAccent
-    [AccentSlider]::AccentColor=$displayAccent;[AccentArrow]::AccentColor=$displayAccent;[AccentSpinner]::AccentColor=$displayAccent;[AccentFrameLine]::OutlineColor=Blend-Color $script:inputColor $displayAccent 42;[TapForgeCard]::BorderColor=Blend-Color $script:colorPanel $displayAccent 25;foreach($arrow in $script:accentArrows){$arrow.Invalidate()};foreach($spinner in $script:accentSpinners){$spinner.Invalidate()};foreach($frame in $script:accentFrames){$frame.Invalidate()}
-    foreach($key in $pageButtons.Keys){$pageButtons[$key].BackColor=if($script:currentPage -eq $key){$script:colorAccent}else{Blend-Color $(if($script:lightTheme){[System.Drawing.Color]::FromArgb(224,228,236)}else{[System.Drawing.Color]::FromArgb(34,40,57)}) $displayAccent}}
-    foreach($key in $settingButtons.Keys){$settingButtons[$key].BackColor=if($script:currentPage -eq $key){$script:colorAccent}else{Blend-Color $(if($script:lightTheme){[System.Drawing.Color]::FromArgb(224,228,236)}else{[System.Drawing.Color]::FromArgb(34,40,57)}) $displayAccent}}
-    $script:accentSwatch.BackColor=$displayAccent;$script:accentHex.Text='#'+$displayAccent.R.ToString('X2')+$displayAccent.G.ToString('X2')+$displayAccent.B.ToString('X2')
-    $script:hueButton.BackColor=$displayAccent;$script:hueButton.ForeColor=[System.Drawing.Color]::White
-    $startButton.BackColor=if($script:running){Blend-Color $script:pageAccents.Clicking ([System.Drawing.Color]::Black) 22}else{$script:pageAccents.Clicking}
-    $pickPoint.BackColor=$displayAccent
-    $gearButton.BackColor=if($script:currentPage -eq 'Appearance'){$script:colorAccent}else{if($script:lightTheme){[System.Drawing.Color]::FromArgb(224,228,236)}else{[System.Drawing.Color]::FromArgb(34,40,57)}}
-    $script:behaviorScrollThumb.BackColor=$script:colorAccent
-    [TapForgeSwitch]::AccentColor=$displayAccent;foreach($toggle in $script:behaviorSwitches){$toggle.Invalidate()}
-    $pending=[System.Collections.Generic.Stack[System.Windows.Forms.Control]]::new();$pending.Push($form);while($pending.Count -gt 0){$c=$pending.Pop();foreach($child in $c.Controls){$pending.Push($child)}
-        if($c -is [System.Windows.Forms.ComboBox]){$c.BackColor=Blend-Color $script:inputColor $displayAccent 22;$c.Invalidate()}
-        elseif($c -is [System.Windows.Forms.TextBox] -or $c -is [System.Windows.Forms.NumericUpDown] -or $c -is [System.Windows.Forms.ListBox]){$c.BackColor=Blend-Color $script:inputColor $displayAccent 12}
-        elseif($c -is [System.Windows.Forms.CheckBox]){$c.FlatStyle='Flat';$c.FlatAppearance.BorderColor=$displayAccent;$c.FlatAppearance.CheckedBackColor=$displayAccent;$c.FlatAppearance.MouseOverBackColor=Blend-Color $script:colorPanel $displayAccent 25}
-        elseif($c -is [System.Windows.Forms.Button]){if([object]::ReferenceEquals($c,$gearButton)){$c.BackColor=if($script:currentPage -eq 'Appearance'){$script:colorAccent}else{Blend-Color $script:colorPanel $displayAccent 18}}elseif($c.Tag -eq 'chrome'){$c.BackColor=if([object]::ReferenceEquals($c,$script:pinButton) -and $form.TopMost){$script:colorAccent}elseif([object]::ReferenceEquals($c,$script:windowMin) -or [object]::ReferenceEquals($c,$script:windowMax) -or [object]::ReferenceEquals($c,$script:windowClose)){if($script:lightTheme){[System.Drawing.Color]::FromArgb(235,238,244)}else{[System.Drawing.Color]::FromArgb(22,22,22)}}else{Blend-Color $script:colorPanel $displayAccent 18}}elseif($pageButtons.ContainsKey([string]$c.Tag)){$c.BackColor=if($c.Tag -eq $script:currentPage){$script:colorAccent}else{Blend-Color $script:colorPanel $displayAccent 18}}elseif($settingButtons.ContainsKey([string]$c.Tag)){$c.BackColor=if($c.Tag -eq $script:currentPage){$script:colorAccent}else{Blend-Color $script:colorPanel $displayAccent 18}}elseif($c.Tag -eq 'primary'){$c.BackColor=$displayAccent}else{$c.BackColor=Blend-Color $script:colorPanel $displayAccent 22}}
-        elseif($c -is [System.Windows.Forms.Panel] -and $c.Tag -eq 'surface'){$c.BackColor=Blend-Color (Blend-Color $script:colorBg $script:colorPanel $script:panelOpacity) $displayAccent 8;if($c -is [TapForgeCard]){$c.Invalidate()}}
-        elseif($c -is [AccentSlider]){$c.Invalidate()}
+public static class TapForgeShell {
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+    // Render crisply on high-DPI screens instead of being bitmap-stretched by Windows.
+    public static void EnableDpiAwareness() { try { SetProcessDPIAware(); } catch (Exception) { } }
+    // Windows 11 rounded corners + dark frame for a borderless window. Harmless on Windows 10.
+    public static void StyleWindow(IntPtr hwnd, bool dark) {
+        if (hwnd == IntPtr.Zero) return;
+        try {
+            int round = 2; DwmSetWindowAttribute(hwnd, 33, ref round, 4);
+            int d = dark ? 1 : 0; DwmSetWindowAttribute(hwnd, 20, ref d, 4); DwmSetWindowAttribute(hwnd, 19, ref d, 4);
+        } catch (Exception) { }
     }
-    $pointList.Invalidate();Update-TaskbarIcon
 }
-$script:behaviorScrollTrack=[System.Windows.Forms.Panel]::new();$script:behaviorScrollTrack.Location=[System.Drawing.Point]::new(0,0);$script:behaviorScrollTrack.Size=[System.Drawing.Size]::new(8,600);$script:behaviorScrollTrack.BackColor=[System.Drawing.Color]::FromArgb(25,29,42);$pageHost.Controls.Add($script:behaviorScrollTrack);$script:behaviorScrollTrack.BringToFront()
-$script:behaviorScrollThumb=[System.Windows.Forms.Panel]::new();$script:behaviorScrollThumb.Location=[System.Drawing.Point]::new(1,0);$script:behaviorScrollThumb.Size=[System.Drawing.Size]::new(6,300);$script:behaviorScrollThumb.BackColor=$script:colorAccent;$script:behaviorScrollThumb.Cursor=[System.Windows.Forms.Cursors]::Hand;$script:behaviorScrollTrack.Controls.Add($script:behaviorScrollThumb)
-$script:behaviorScrollOffset=0;$script:behaviorScrollDragging=$false;$script:behaviorScrollGrabY=0
-function Set-BehaviorScroll([int]$offset){$contentHeight=[Math]::Max($advanced.Height,292+$behaviorExtras.Height);$max=[Math]::Max(0,$contentHeight-$behaviorPage.ClientSize.Height);$script:behaviorScrollOffset=[Math]::Max(0,[Math]::Min($max,$offset));$behaviorPage.SuspendLayout();$advanced.Top=-$script:behaviorScrollOffset;$behaviorExtras.Top=292-$script:behaviorScrollOffset;$behaviorPage.ResumeLayout($false);$trackHeight=[Math]::Max(1,$script:behaviorScrollTrack.Height);$thumbHeight=[Math]::Max(36,[int]($trackHeight*[Math]::Min(1.0,$behaviorPage.ClientSize.Height/[double]$contentHeight)));$script:behaviorScrollThumb.Height=[Math]::Min($trackHeight,$thumbHeight);$travel=[Math]::Max(1,$trackHeight-$script:behaviorScrollThumb.Height);$script:behaviorScrollThumb.Top=if($max -gt 0){[int]($script:behaviorScrollOffset/$max*$travel)}else{0}}
-function Add-BehaviorWheel([System.Windows.Forms.Control]$control){$control.Add_MouseWheel({param($s,$e)Set-BehaviorScroll ($script:behaviorScrollOffset-[Math]::Sign($e.Delta)*48)});foreach($child in $control.Controls){Add-BehaviorWheel $child}}
-$script:behaviorScrollThumb.Add_MouseDown({param($s,$e)$script:behaviorScrollDragging=$true;$script:behaviorScrollGrabY=$e.Y;$s.Capture=$true})
-$script:behaviorScrollThumb.Add_MouseMove({if($script:behaviorScrollDragging){$max=[Math]::Max(0,[Math]::Max($advanced.Height,292+$behaviorExtras.Height)-$behaviorPage.ClientSize.Height);$travel=[Math]::Max(1,$script:behaviorScrollTrack.Height-$script:behaviorScrollThumb.Height);$cursorY=$script:behaviorScrollTrack.PointToClient([System.Windows.Forms.Control]::MousePosition).Y;$top=[Math]::Max(0,[Math]::Min($travel,$cursorY-$script:behaviorScrollGrabY));Set-BehaviorScroll $(if($travel){[int]($top/$travel*$max)}else{0})}})
-$script:behaviorScrollThumb.Add_MouseUp({$script:behaviorScrollDragging=$false;$script:behaviorScrollThumb.Capture=$false})
-$script:behaviorScrollTrack.Add_MouseDown({param($s,$e)if($e.Y -lt $script:behaviorScrollThumb.Top){Set-BehaviorScroll ($script:behaviorScrollOffset-$behaviorPage.ClientSize.Height)}elseif($e.Y -gt ($script:behaviorScrollThumb.Top+$script:behaviorScrollThumb.Height)){Set-BehaviorScroll ($script:behaviorScrollOffset+$behaviorPage.ClientSize.Height)}})
-Add-BehaviorWheel $behaviorPage
-function Apply-Theme {
-    $script:lightTheme=($themePick.SelectedIndex -eq 1)
-    if($script:lightTheme){$script:colorBg=[System.Drawing.Color]::FromArgb(242,244,248);$script:colorPanel=[System.Drawing.Color]::FromArgb(255,255,255);$inputColor=[System.Drawing.Color]::FromArgb(250,251,253);$textColor=[System.Drawing.Color]::FromArgb(28,32,43);$script:colorMuted=[System.Drawing.Color]::FromArgb(94,101,116);[TapForgeCard]::BorderColor=[System.Drawing.Color]::FromArgb(220,224,233)}else{$script:colorBg=[System.Drawing.Color]::FromArgb(15,18,28);$script:colorPanel=[System.Drawing.Color]::FromArgb(24,29,43);$inputColor=[System.Drawing.Color]::FromArgb(34,40,57);$textColor=[System.Drawing.Color]::White;$script:colorMuted=[System.Drawing.Color]::FromArgb(151,161,181);[TapForgeCard]::BorderColor=[System.Drawing.Color]::FromArgb(45,52,69)};$script:inputColor=$inputColor
-    $stack=[System.Collections.Generic.Stack[System.Windows.Forms.Control]]::new();$stack.Push($form)
-    while($stack.Count -gt 0){$c=$stack.Pop();foreach($child in $c.Controls){$stack.Push($child)}
-        if($c -is [System.Windows.Forms.Form]){$c.BackColor=$script:colorBg;$c.ForeColor=$textColor}
-        elseif($c -is [System.Windows.Forms.Panel]){if($c.Tag -eq 'surface'){$c.BackColor=Blend-Color $script:colorBg $script:colorPanel $script:panelOpacity}elseif([object]::ReferenceEquals($c,$navBar)){$c.BackColor=if($script:lightTheme){[System.Drawing.Color]::FromArgb(235,238,244)}else{[System.Drawing.Color]::FromArgb(22,22,22)}}elseif([object]::ReferenceEquals($c,$script:titleAccentLine)){$c.BackColor=$script:colorAccent}elseif([object]::ReferenceEquals($c,$settingsBar)){$c.BackColor=$script:colorPanel}elseif([object]::ReferenceEquals($c,$clickPage) -or [object]::ReferenceEquals($c,$behaviorPage) -or [object]::ReferenceEquals($c,$appearancePage)){$c.BackColor=[System.Drawing.Color]::Transparent}else{$c.BackColor=$script:colorBg}}
-        elseif($c -is [System.Windows.Forms.Label]){$c.ForeColor=if($c.Tag -eq 'muted'){$script:colorMuted}else{$textColor}}
-        elseif($c -is [System.Windows.Forms.ComboBox] -or $c -is [System.Windows.Forms.TextBox] -or $c -is [System.Windows.Forms.NumericUpDown] -or $c -is [System.Windows.Forms.ListBox]){$c.BackColor=$inputColor;$c.ForeColor=$textColor}
-        elseif($c -is [TapForgeSwitch]){$c.BackColor=[System.Drawing.Color]::Transparent;$c.ForeColor=$textColor}
-        elseif($c -is [System.Windows.Forms.CheckBox]){$c.BackColor=$script:colorPanel;$c.ForeColor=$textColor}
-        elseif($c -is [AccentSlider]){$c.BackColor=$script:colorPanel;$c.Invalidate()}
-        elseif($c -is [System.Windows.Forms.TrackBar]){$c.BackColor=$script:colorPanel}
-        elseif($c -is [System.Windows.Forms.Button]){$c.BackColor=if($c.Tag -eq 'primary'){$script:colorAccent}else{$script:colorPanel};$c.ForeColor=if($c.Tag -eq 'primary'){[System.Drawing.Color]::White}else{$textColor}}
+
+// Small background HTTP helper so update checks and downloads never freeze the window.
+// PowerShell polls Done from a UI timer.
+public sealed class TapForgeRequest {
+    public volatile bool Done;
+    public string Text;
+    public string Error;
+    public long Received;
+    public long Total = -1;
+    public static TapForgeRequest GetText(string url) {
+        TapForgeRequest r = new TapForgeRequest();
+        Thread t = new Thread(delegate() { r.Run(url, null); });
+        t.IsBackground = true; t.Start(); return r;
     }
-    $pageHost.BackColor=$script:colorBg;$script:behaviorScrollTrack.BackColor=if($script:lightTheme){[System.Drawing.Color]::FromArgb(221,225,233)}else{[System.Drawing.Color]::FromArgb(25,29,42)};$script:behaviorScrollThumb.BackColor=$script:colorAccent;Apply-Accent
+    public static TapForgeRequest Download(string url, string path) {
+        TapForgeRequest r = new TapForgeRequest();
+        Thread t = new Thread(delegate() { r.Run(url, path); });
+        t.IsBackground = true; t.Start(); return r;
+    }
+    void Run(string url, string path) {
+        try {
+            System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12;
+            System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "GET"; req.UserAgent = "TapForge-Updater"; req.Accept = "application/vnd.github+json";
+            req.Timeout = path == null ? 8000 : 30000; req.ReadWriteTimeout = path == null ? 8000 : 30000;
+            using (System.Net.WebResponse resp = req.GetResponse())
+            using (System.IO.Stream input = resp.GetResponseStream()) {
+                Total = resp.ContentLength;
+                if (path == null) {
+                    using (System.IO.StreamReader reader = new System.IO.StreamReader(input)) { Text = reader.ReadToEnd(); }
+                } else {
+                    using (System.IO.FileStream file = System.IO.File.Create(path)) {
+                        byte[] buffer = new byte[65536]; int n;
+                        while ((n = input.Read(buffer, 0, buffer.Length)) > 0) { file.Write(buffer, 0, n); Received += n; }
+                    }
+                }
+            }
+        } catch (Exception ex) { Error = ex.Message; }
+        Done = true;
+    }
 }
-function Update-TaskbarIcon {
-    if(!$script:logoSourceImage){return}
-    $newBitmap=[LogoColorizer]::Tint($script:logoSourceImage,$script:colorAccent);$oldBitmap=$script:brandImage;$script:brandImage=$newBitmap
-    if($script:brandMark -and !$script:brandMark.IsDisposed){$script:brandMark.Image=$newBitmap}
-    $newIcon=[LogoColorizer]::MakeIcon($newBitmap);$oldIcon=$script:logoIcon;$script:logoIcon=$newIcon;$form.Icon=$newIcon
-    if($script:trayIcon -and !$script:trayIcon.IsDisposed){$script:trayIcon.Icon=$newIcon}
-    if($oldIcon -and ![object]::ReferenceEquals($oldIcon,$newIcon)){$oldIcon.Dispose()}
-    if($oldBitmap -and ![object]::ReferenceEquals($oldBitmap,$script:logoSourceImage)){$oldBitmap.Dispose()}
-}
-$form.Icon=$script:logoIcon
-$script:settingsDirectory=Join-Path $env:LOCALAPPDATA 'TapForge';[void](New-Item -ItemType Directory -Force -Path $script:settingsDirectory);$script:windowStateFile=Join-Path $script:settingsDirectory 'window.json';$script:settingsFile=Join-Path $script:settingsDirectory 'settings.json'
-if($script:rememberPosition.Checked -and (Test-Path -LiteralPath $script:windowStateFile)){try{$w=Get-Content -LiteralPath $script:windowStateFile -Raw|ConvertFrom-Json;$candidate=[System.Drawing.Rectangle]::new([int]$w.x,[int]$w.y,$form.Width,$form.Height);$visible=$false;foreach($screen in [System.Windows.Forms.Screen]::AllScreens){if($screen.WorkingArea.IntersectsWith($candidate)){$visible=$true}};if($visible){$form.StartPosition='Manual';$form.Location=[System.Drawing.Point]::new([int]$w.x,[int]$w.y)}}catch{}}
-$script:footerToggle.Add_CheckedChanged({$script:footerLeft.Visible=$script:footerToggle.Checked;$script:footerRight.Visible=$script:footerToggle.Checked})
-$themePick.Add_SelectedIndexChanged({Apply-Theme;Update-TaskbarIcon})
-$appearanceModePick.Add_SelectedIndexChanged({$script:appearanceMode=if($appearanceModePick.SelectedIndex -eq 0){'Global'}else{'Individual page'};Apply-Accent})
-$script:accentTarget.Add_SelectedIndexChanged({Apply-Accent})
-$script:hueButton.Add_Click({$targetPage=if($script:appearanceMode -eq 'Global'){$script:currentPage}else{$script:accentTarget.SelectedItem.ToString()};$picked=Show-HuePicker $script:pageAccents[$targetPage];if($picked){if($script:appearanceMode -eq 'Global'){$script:globalAccent=$picked;foreach($key in $script:pageAccents.Keys){$script:pageAccents[$key]=$picked}}else{$script:pageAccents[$targetPage]=$picked};Apply-Accent;Update-TaskbarIcon}})
-$script:activeIcon.Add_CheckedChanged({Update-TaskbarIcon});$script:iconTheme.Add_SelectedIndexChanged({Update-TaskbarIcon});$script:iconColor.Add_SelectedIndexChanged({Update-TaskbarIcon})
-$script:compactButton=New-Button 'Compact' 0 6 68 32 ([System.Drawing.Color]::FromArgb(34,40,57)) ([System.Drawing.Color]::White);$script:compactButton.Font=[System.Drawing.Font]::new('Segoe UI',9,[System.Drawing.FontStyle]::Bold);$navBar.Controls.Add($script:compactButton);$script:headerTips.SetToolTip($script:compactButton,'Switch to compact controls')
-$compactPanel=New-Card 20 54 850 145;$form.Controls.Add($compactPanel);$compactPanel.Visible=$false
-$compactPanel.Controls.Add((New-Label 'QUICK CONTROLS' 18 14 200 22 9 $script:colorMuted $true))
-$compactPanel.Controls.Add((New-Label 'Clicks per second' 18 50 140 24 10 ([System.Drawing.Color]::White) $true))
-$quickRate=[System.Windows.Forms.NumericUpDown]::new();$quickRate.Location=[System.Drawing.Point]::new(160,46);$quickRate.Size=[System.Drawing.Size]::new(110,32);$quickRate.Minimum=1;$quickRate.Maximum=500;$quickRate.Value=10;$quickRate.BackColor=[System.Drawing.Color]::FromArgb(34,40,57);$quickRate.ForeColor=[System.Drawing.Color]::White;$compactPanel.Controls.Add($quickRate)
-$quickHotkey=New-Label 'F6  Start / stop  ·  F7  emergency stop' 300 50 320 28 9 $script:colorMuted;$compactPanel.Controls.Add($quickHotkey)
-function Update-HotkeyCaption { $start=$keyPick.SelectedItem.ToString();$emergency=$script:emergencyKey.SelectedItem.ToString();$quickHotkey.Text="$start  Start / stop  ·  $emergency  Emergency stop";$startKeyHint.Text="Current shortcut: $start · works while TapForge is minimized." }
-$keyPick.Add_SelectedIndexChanged({if($quickHotkey){Update-HotkeyCaption}});$script:emergencyKey.Add_SelectedIndexChanged({if($quickHotkey){Update-HotkeyCaption}});Update-HotkeyCaption
-$quickStart=New-Button '▶  Start' 18 94 300 36 $script:colorAccent ([System.Drawing.Color]::White);$quickStop=New-Button '■  Stop' 336 94 300 36 ([System.Drawing.Color]::FromArgb(48,55,73)) ([System.Drawing.Color]::White);$compactPanel.Controls.AddRange(@($quickStart,$quickStop))
-$script:compactButton.Add_Click({if(!$script:compactMode){$script:compactMode=$true;$pageHost.Hide();$settingsBar.Hide();$script:compactButton.Text='Expand';$script:headerTips.SetToolTip($script:compactButton,'Return to full window');$compactPanel.Show();$form.MinimumSize=[System.Drawing.Size]::new(900,260);$form.Size=[System.Drawing.Size]::new(900,260)}else{$script:compactMode=$false;$compactPanel.Hide();$pageHost.Show();$settingsBar.Hide();$script:compactButton.Text='Compact';$script:headerTips.SetToolTip($script:compactButton,'Switch to compact controls');$form.MinimumSize=[System.Drawing.Size]::new(1080,780);$form.Size=[System.Drawing.Size]::new(1080,800)}})
-$quickRate.Add_ValueChanged({$speedMode.SelectedIndex=1;$rate.Value=[Math]::Min([decimal]$quickRate.Value,$rate.Maximum)})
-$rate.Add_ValueChanged({if($quickRate.Value -ne [decimal]$rate.Value){$quickRate.Value=[Math]::Min([decimal]$rate.Value,$quickRate.Maximum)}})
-$quickStart.Add_Click({if($script:running){Stop-Clicking}else{Start-Clicking}});$quickStop.Add_Click({Stop-Clicking})
-function Save-UserSettings {
-    try {
-        $accents=@{};foreach($name in $script:pageAccents.Keys){$c=$script:pageAccents[$name];$accents[$name]='#'+$c.R.ToString('X2')+$c.G.ToString('X2')+$c.B.ToString('X2')}
-        $g=$script:globalAccent;$globalHex='#'+$g.R.ToString('X2')+$g.G.ToString('X2')+$g.B.ToString('X2')
-        $saved=@{
-            intervalMs=(Get-IntervalMilliseconds);intervalUnit=$intervalUnit.SelectedIndex;button=$buttonPick.SelectedIndex;stopMode=$modePick.SelectedIndex;limit=[long]$limit.Value
-            speedMode=$speedMode.SelectedIndex;rate=[int]$rate.Value;extendedSpeed=$script:extendedSpeed.Checked;startKey=[string]$keyPick.SelectedItem;emergencyKey=[string]$script:emergencyKey.SelectedItem;hotkeyMode=$hotkeyMode.SelectedIndex
-            keyboardMode=$keyboardMode.Checked;keyCode=$keyCodePick.SelectedIndex;doubleClick=$doubleClick.Checked;duty=[int]$duty.Value;randomize=[int]$randomize.Value
-            cornerStop=$cornerStop.Checked;cornerSize=[int]$cornerSize.Value;edgeStop=$edgeStop.Checked;edgeSize=[int]$edgeSize.Value
-            alwaysTop=$script:alwaysTop.Checked;stopAlert=$script:stopAlert.Checked;strictHotkey=$script:strictHotkey.Checked;stopAltTab=$script:stopAltTab.Checked;minimizeTray=$script:minimizeTray.Checked;rememberPosition=$script:rememberPosition.Checked;runOnStartup=$script:runOnStartup.Checked
-            pointDefaultClicks=[int]$script:pointDefaultClicks.Value;pointDefaultRadius=[int]$script:pointDefaultRadius.Value;pointsEnabled=$script:pointsEnabled.Checked;stopWhenPointsDone=$script:stopWhenPointsDone.Checked;points=@($script:points | ForEach-Object {@{x=$_.X;y=$_.Y}})
-            filterProcess=$script:filterProcess.Checked;processTitle=$(if($processList.SelectedItem){($processList.SelectedItem.ToString() -replace '  \(PID \d+\)$','')}else{''});theme=$themePick.SelectedIndex;appearanceMode=$appearanceModePick.SelectedIndex;globalAccent=$globalHex;pageAccents=$accents
-            activeIcon=$script:activeIcon.Checked;iconTheme=$script:iconTheme.SelectedIndex;iconColor=$script:iconColor.SelectedIndex;footer=$script:footerToggle.Checked;page=$script:currentPage;compact=$script:compactMode
+'@
+$uiSource = @'
+using System;
+using System.Globalization;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Shapes;
+using System.Windows.Threading;
+
+namespace TapForgeUI {
+    // Themed numeric input (WPF has none built in): text field + up/down arrows,
+    // mouse wheel while focused, arrow keys, and press-and-hold repeat.
+    public class NumberBox : Border {
+        readonly TextBox box = new TextBox();
+        readonly DispatcherTimer repeat = new DispatcherTimer();
+        int repeatDir;
+        double val;
+        double min;
+        double max = 100;
+        double inc = 1;
+        int decimals;
+        bool suppress;
+        public event EventHandler ValueChanged;
+
+        public NumberBox() {
+            CornerRadius = new CornerRadius(8);
+            BorderThickness = new Thickness(1);
+            Height = 34;
+            SnapsToDevicePixels = true;
+            SetResourceReference(BackgroundProperty, "Input");
+            SetResourceReference(BorderBrushProperty, "InputBorder");
+
+            Grid grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition());
+            ColumnDefinition spinCol = new ColumnDefinition();
+            spinCol.Width = new GridLength(24);
+            grid.ColumnDefinitions.Add(spinCol);
+
+            box.Style = new Style(typeof(TextBox));
+            box.Background = Brushes.Transparent;
+            box.BorderThickness = new Thickness(0);
+            box.VerticalContentAlignment = VerticalAlignment.Center;
+            box.Padding = new Thickness(8, 0, 2, 0);
+            box.FontSize = 13;
+            box.SetResourceReference(Control.ForegroundProperty, "Text");
+            box.SetResourceReference(TextBoxBase.CaretBrushProperty, "Text");
+            box.SetResourceReference(TextBoxBase.SelectionBrushProperty, "Accent");
+            box.KeyDown += OnKey;
+            box.GotKeyboardFocus += delegate(object s, KeyboardFocusChangedEventArgs e) { SetResourceReference(BorderBrushProperty, "Accent"); };
+            box.LostKeyboardFocus += delegate(object s, KeyboardFocusChangedEventArgs e) { SetResourceReference(BorderBrushProperty, "InputBorder"); Commit(); };
+            grid.Children.Add(box);
+
+            StackPanel spin = new StackPanel();
+            spin.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(spin, 1);
+            spin.Children.Add(MakeArrow(1));
+            spin.Children.Add(MakeArrow(-1));
+            grid.Children.Add(spin);
+            Child = grid;
+
+            repeat.Tick += delegate(object s, EventArgs e) { repeat.Interval = TimeSpan.FromMilliseconds(45); Step(repeatDir); };
+            PreviewMouseWheel += delegate(object s, MouseWheelEventArgs e) {
+                if (IsEnabled && box.IsKeyboardFocusWithin) { Step(e.Delta > 0 ? 1 : -1); e.Handled = true; }
+            };
+            IsEnabledChanged += delegate(object s, DependencyPropertyChangedEventArgs e) { Opacity = IsEnabled ? 1.0 : 0.45; };
+            UpdateText();
         }
-        $tmp=$script:settingsFile+'.tmp';$saved|ConvertTo-Json -Depth 8|Set-Content -LiteralPath $tmp -Encoding UTF8;Move-Item -LiteralPath $tmp -Destination $script:settingsFile -Force
-    } catch { try { if(Test-Path -LiteralPath ($script:settingsFile+'.tmp')){Remove-Item -LiteralPath ($script:settingsFile+'.tmp') -Force} } catch {} }
-}
-function Restore-UserSettings {
-    if(!(Test-Path -LiteralPath $script:settingsFile)){return}
-    try {
-        $d=Get-Content -LiteralPath $script:settingsFile -Raw|ConvertFrom-Json
-        $script:extendedSpeed.Checked=[bool]$d.extendedSpeed
-        if($d.PSObject.Properties['intervalUnit']){$intervalUnit.SelectedIndex=[Math]::Max(0,[Math]::Min(2,[int]$d.intervalUnit))};if($d.PSObject.Properties['intervalMs']){Set-IntervalMilliseconds ([long]$d.intervalMs)}
-        $buttonPick.SelectedIndex=[Math]::Max(0,[Math]::Min($buttonPick.Items.Count-1,[int]$d.button));$modePick.SelectedIndex=[Math]::Max(0,[Math]::Min($modePick.Items.Count-1,[int]$d.stopMode));$limit.Value=[Math]::Max($limit.Minimum,[Math]::Min($limit.Maximum,[decimal]$d.limit))
-        $speedMode.SelectedIndex=[Math]::Max(0,[Math]::Min(1,[int]$d.speedMode));$rate.Value=[Math]::Max($rate.Minimum,[Math]::Min($rate.Maximum,[decimal]$d.rate));$hotkeyMode.SelectedIndex=[Math]::Max(0,[Math]::Min(1,[int]$d.hotkeyMode))
-        if($keyPick.Items.Contains([string]$d.startKey)){$keyPick.SelectedItem=[string]$d.startKey};if($script:emergencyKey.Items.Contains([string]$d.emergencyKey)){$script:emergencyKey.SelectedItem=[string]$d.emergencyKey}
-        $keyboardMode.Checked=[bool]$d.keyboardMode;$keyCodePick.SelectedIndex=[Math]::Max(0,[Math]::Min($keyCodePick.Items.Count-1,[int]$d.keyCode));$doubleClick.Checked=[bool]$d.doubleClick
-        $duty.Value=[Math]::Max($duty.Minimum,[Math]::Min($duty.Maximum,[decimal]$d.duty));$randomize.Value=[Math]::Max($randomize.Minimum,[Math]::Min($randomize.Maximum,[decimal]$d.randomize))
-        $cornerStop.Checked=[bool]$d.cornerStop;$cornerSize.Value=[Math]::Max($cornerSize.Minimum,[Math]::Min($cornerSize.Maximum,[decimal]$d.cornerSize));$edgeStop.Checked=[bool]$d.edgeStop;$edgeSize.Value=[Math]::Max($edgeSize.Minimum,[Math]::Min($edgeSize.Maximum,[decimal]$d.edgeSize))
-        $script:alwaysTop.Checked=[bool]$d.alwaysTop;$script:stopAlert.Checked=[bool]$d.stopAlert;$script:strictHotkey.Checked=[bool]$d.strictHotkey;$script:stopAltTab.Checked=[bool]$d.stopAltTab;$script:minimizeTray.Checked=[bool]$d.minimizeTray;$script:rememberPosition.Checked=[bool]$d.rememberPosition;$script:runOnStartup.Checked=[bool]$d.runOnStartup
-        if($script:rememberPosition.Checked -and (Test-Path -LiteralPath $script:windowStateFile)){try{$w=Get-Content -LiteralPath $script:windowStateFile -Raw|ConvertFrom-Json;$candidate=[System.Drawing.Rectangle]::new([int]$w.x,[int]$w.y,$form.Width,$form.Height);$visible=$false;foreach($screen in [System.Windows.Forms.Screen]::AllScreens){if($screen.WorkingArea.IntersectsWith($candidate)){$visible=$true}};if($visible){$form.StartPosition='Manual';$form.Location=[System.Drawing.Point]::new([int]$w.x,[int]$w.y)}}catch{}}elseif(!$script:rememberPosition.Checked){$form.StartPosition='CenterScreen'}
-        $script:pointDefaultClicks.Value=[Math]::Max($script:pointDefaultClicks.Minimum,[Math]::Min($script:pointDefaultClicks.Maximum,[decimal]$d.pointDefaultClicks));$script:pointDefaultRadius.Value=[Math]::Max($script:pointDefaultRadius.Minimum,[Math]::Min($script:pointDefaultRadius.Maximum,[decimal]$d.pointDefaultRadius));$script:pointsEnabled.Checked=[bool]$d.pointsEnabled;$script:stopWhenPointsDone.Checked=[bool]$d.stopWhenPointsDone
-        $script:points.Clear();$pointList.Items.Clear();foreach($p in $d.points){[void]$script:points.Add([System.Drawing.Point]::new([int]$p.x,[int]$p.y));[void]$pointList.Items.Add("Point $($script:points.Count): $($p.x), $($p.y)")}
-        $script:filterProcess.Checked=[bool]$d.filterProcess;if($d.processTitle){$refreshProcesses.PerformClick();for($i=0;$i -lt $processList.Items.Count;$i++){if($processList.Items[$i].ToString() -like ([string]$d.processTitle+'  (PID *')){$processList.SelectedIndex=$i;break}}}
-        if($d.PSObject.Properties['theme']){$themePick.SelectedIndex=[Math]::Max(0,[Math]::Min(1,[int]$d.theme))};if($d.PSObject.Properties['appearanceMode']){$appearanceModePick.SelectedIndex=[Math]::Max(0,[Math]::Min(1,[int]$d.appearanceMode))}
-        if($d.globalAccent){$script:globalAccent=[System.Drawing.ColorTranslator]::FromHtml([string]$d.globalAccent)};if($d.pageAccents){foreach($prop in $d.pageAccents.PSObject.Properties){if($script:pageAccents.ContainsKey($prop.Name)){$script:pageAccents[$prop.Name]=[System.Drawing.ColorTranslator]::FromHtml([string]$prop.Value)}}}
-        $script:activeIcon.Checked=[bool]$d.activeIcon;$script:iconTheme.SelectedIndex=[Math]::Max(0,[Math]::Min($script:iconTheme.Items.Count-1,[int]$d.iconTheme));$script:iconColor.SelectedIndex=[Math]::Max(0,[Math]::Min($script:iconColor.Items.Count-1,[int]$d.iconColor));$script:footerToggle.Checked=[bool]$d.footer
-        $script:footerLeft.Visible=$script:footerToggle.Checked;$script:footerRight.Visible=$script:footerToggle.Checked
-        if($d.compact){$script:compactButton.PerformClick()};if($d.page -and $d.page -in @('Clicking','Behavior','Click Points','Appearance','Keybinds','Process List','Presets','Maintenance')){Show-Page ([string]$d.page)}
-        Update-HotkeyCaption;Update-TaskbarIcon
-    } catch { }
-}
-Restore-UserSettings
-$form.Add_HandleCreated({Enable-DarkChrome $form});Apply-Theme;Show-Page $(if($script:currentPage){$script:currentPage}else{'Clicking'})
 
-function Stop-Clicking {
-    if ($script:clickTimer) { $script:clickTimer.Dispose(); $script:clickTimer=$null }
-    [ClickNative]::Stop()
-    $script:running=$false
-    if (!$form.IsDisposed) { $startButton.Text='▶   Start clicking';$quickStart.Text='▶  Start'; $statusPill.Text='●  READY'; $statusPill.ForeColor=[System.Drawing.Color]::FromArgb(108,220,170);Update-TaskbarIcon;Apply-Accent;if($script:stopReason -and $script:stopAlert.Checked){$script:trayIcon.BalloonTipTitle='TapForge stopped';$script:trayIcon.BalloonTipText=$script:stopReason;$script:trayIcon.Visible=$true;$script:trayIcon.ShowBalloonTip(2500)};$script:stopReason=$null }
+        FrameworkElement MakeArrow(int dir) {
+            Border b = new Border();
+            b.Width = 20; b.Height = 14;
+            b.CornerRadius = new CornerRadius(4);
+            b.Background = Brushes.Transparent;
+            b.Cursor = Cursors.Hand;
+            Path p = new Path();
+            p.Data = Geometry.Parse(dir > 0 ? "M0,4 L4,0 L8,4" : "M0,0 L4,4 L8,0");
+            p.StrokeThickness = 1.6;
+            p.HorizontalAlignment = HorizontalAlignment.Center;
+            p.VerticalAlignment = VerticalAlignment.Center;
+            p.SetResourceReference(Shape.StrokeProperty, "Muted");
+            b.Child = p;
+            b.MouseEnter += delegate(object s, MouseEventArgs e) { b.SetResourceReference(Border.BackgroundProperty, "Hover"); p.SetResourceReference(Shape.StrokeProperty, "Accent"); };
+            b.MouseLeave += delegate(object s, MouseEventArgs e) { b.Background = Brushes.Transparent; p.SetResourceReference(Shape.StrokeProperty, "Muted"); };
+            b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) {
+                if (!IsEnabled) return;
+                Commit(); Step(dir); repeatDir = dir;
+                repeat.Interval = TimeSpan.FromMilliseconds(400); repeat.Start();
+                b.CaptureMouse(); e.Handled = true;
+            };
+            b.MouseLeftButtonUp += delegate(object s, MouseButtonEventArgs e) { repeat.Stop(); b.ReleaseMouseCapture(); e.Handled = true; };
+            b.LostMouseCapture += delegate(object s, MouseEventArgs e) { repeat.Stop(); };
+            return b;
+        }
+
+        void OnKey(object sender, KeyEventArgs e) {
+            if (e.Key == Key.Enter) { Commit(); box.SelectAll(); e.Handled = true; }
+            else if (e.Key == Key.Up) { Commit(); Step(1); e.Handled = true; }
+            else if (e.Key == Key.Down) { Commit(); Step(-1); e.Handled = true; }
+        }
+
+        void Step(int dir) { Value = val + dir * inc; }
+
+        void Commit() {
+            double parsed;
+            string t = box.Text.Trim();
+            if (double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ||
+                double.TryParse(t, NumberStyles.Any, CultureInfo.CurrentCulture, out parsed)) {
+                Value = parsed;
+            } else {
+                UpdateText();
+            }
+        }
+
+        double Clamp(double v) {
+            if (double.IsNaN(v) || double.IsInfinity(v)) v = min;
+            if (v < min) v = min;
+            if (v > max) v = max;
+            return Math.Round(v, decimals);
+        }
+
+        void UpdateText() { box.Text = val.ToString("F" + decimals, CultureInfo.InvariantCulture); }
+
+        public double Value {
+            get { return val; }
+            set {
+                double v = Clamp(value);
+                bool changed = v != val;
+                val = v;
+                UpdateText();
+                if (changed && !suppress && ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+        public double Minimum { get { return min; } set { min = value; if (val < min) Value = min; } }
+        public double Maximum { get { return max; } set { max = value; if (val > max) Value = max; } }
+        public int Decimals { get { return decimals; } set { decimals = Math.Max(0, Math.Min(6, value)); Value = val; UpdateText(); } }
+        public double Increment { get { return inc; } set { inc = value; } }
+
+        // Change limits/format and value without raising ValueChanged.
+        public void Configure(double minimum, double maximum, int places, double increment, double value) {
+            min = minimum; max = maximum; decimals = Math.Max(0, Math.Min(6, places)); inc = increment;
+            val = Clamp(value); UpdateText();
+        }
+        public void SetQuiet(double v) { suppress = true; try { Value = v; } finally { suppress = false; } }
+    }
 }
+'@
+$resourcesXaml = @'
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Theme colors. These brushes are replaced at runtime by Apply-Theme / Set-Accent. -->
+  <SolidColorBrush x:Key="Bg" Color="#0E0E10"/>
+  <SolidColorBrush x:Key="Chrome" Color="#151517"/>
+  <SolidColorBrush x:Key="Card" Color="#1A1A1D"/>
+  <SolidColorBrush x:Key="CardBorder" Color="#2A2A2F"/>
+  <SolidColorBrush x:Key="Input" Color="#222226"/>
+  <SolidColorBrush x:Key="InputBorder" Color="#34343B"/>
+  <SolidColorBrush x:Key="Hover" Color="#28282D"/>
+  <SolidColorBrush x:Key="Text" Color="#F2F2F5"/>
+  <SolidColorBrush x:Key="Muted" Color="#9A9AA5"/>
+  <SolidColorBrush x:Key="SwitchOff" Color="#3A3A42"/>
+  <SolidColorBrush x:Key="ScrollThumb" Color="#3A3A42"/>
+  <SolidColorBrush x:Key="Accent" Color="#7B61FF"/>
+  <SolidColorBrush x:Key="AccentSoft" Color="#337B61FF"/>
+  <SolidColorBrush x:Key="OnAccent" Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="Good" Color="#5FD39B"/>
+  <SolidColorBrush x:Key="Warn" Color="#FFC45F"/>
+  <SolidColorBrush x:Key="Danger" Color="#FF6B6B"/>
+
+  <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+
+  <!-- Text styles -->
+  <Style x:Key="Glyph" TargetType="TextBlock">
+    <Setter Property="FontFamily" Value="{StaticResource IconFont}"/>
+    <Setter Property="VerticalAlignment" Value="Center"/>
+  </Style>
+  <Style x:Key="PageTitle" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="20"/>
+    <Setter Property="FontWeight" Value="Bold"/>
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="Margin" Value="2,0,0,12"/>
+  </Style>
+  <Style x:Key="CardTitle" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="14"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+  </Style>
+  <Style x:Key="CardSub" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+    <Setter Property="Margin" Value="0,2,0,0"/>
+    <Setter Property="TextWrapping" Value="Wrap"/>
+  </Style>
+  <Style x:Key="RowTitle" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="14"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+  </Style>
+  <Style x:Key="RowSub" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+    <Setter Property="TextWrapping" Value="Wrap"/>
+    <Setter Property="Margin" Value="0,2,12,0"/>
+  </Style>
+  <Style x:Key="FieldLabel" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="11"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+    <Setter Property="Margin" Value="0,0,0,6"/>
+  </Style>
+  <Style x:Key="StatValue" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="20"/>
+    <Setter Property="FontWeight" Value="Bold"/>
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+  </Style>
+
+  <!-- Surfaces -->
+  <Style x:Key="Panel" TargetType="Border">
+    <Setter Property="Background" Value="{DynamicResource Card}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource CardBorder}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="CornerRadius" Value="12"/>
+    <Setter Property="Padding" Value="16,14"/>
+    <Setter Property="Margin" Value="0,0,0,12"/>
+    <Setter Property="SnapsToDevicePixels" Value="True"/>
+  </Style>
+  <Style x:Key="Divider" TargetType="Border">
+    <Setter Property="Height" Value="1"/>
+    <Setter Property="Background" Value="{DynamicResource CardBorder}"/>
+    <Setter Property="Margin" Value="0,12"/>
+  </Style>
+
+  <!-- Buttons -->
+  <Style TargetType="Button">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="Background" Value="{DynamicResource Input}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource InputBorder}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Padding" Value="14,0"/>
+    <Setter Property="Height" Value="34"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="SnapsToDevicePixels" Value="True"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Button">
+          <Border x:Name="Bd" CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                  BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsPressed" Value="True">
+              <Setter TargetName="Bd" Property="Opacity" Value="0.75"/>
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+              <Setter Property="Opacity" Value="0.45"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter Property="Background" Value="{DynamicResource Hover}"/>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+  <Style x:Key="AccentButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+    <Setter Property="Background" Value="{DynamicResource Accent}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource Accent}"/>
+    <Setter Property="Foreground" Value="{DynamicResource OnAccent}"/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter Property="Background" Value="{DynamicResource Accent}"/>
+        <Setter Property="Opacity" Value="0.88"/>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+  <Style x:Key="TitleButton" TargetType="Button">
+    <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Width" Value="36"/>
+    <Setter Property="Height" Value="32"/>
+    <Setter Property="FontFamily" Value="{StaticResource IconFont}"/>
+    <Setter Property="FontSize" Value="15"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="Margin" Value="1,0"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Button">
+          <Border x:Name="Bd" CornerRadius="7" Background="{TemplateBinding Background}">
+            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsPressed" Value="True">
+              <Setter TargetName="Bd" Property="Opacity" Value="0.7"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter Property="Background" Value="{DynamicResource Hover}"/>
+        <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+  <Style x:Key="CaptionButton" TargetType="Button" BasedOn="{StaticResource TitleButton}">
+    <Setter Property="FontSize" Value="10"/>
+    <Setter Property="Width" Value="40"/>
+  </Style>
+  <Style x:Key="CloseButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter Property="Background" Value="#E5484D"/>
+        <Setter Property="Foreground" Value="White"/>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+
+  <!-- Sidebar entries -->
+  <Style x:Key="SideItem" TargetType="RadioButton">
+    <Setter Property="Foreground" Value="{DynamicResource Muted}"/>
+    <Setter Property="Height" Value="36"/>
+    <Setter Property="Margin" Value="0,0,0,3"/>
+    <Setter Property="FontSize" Value="13.5"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="GroupName" Value="SideNav"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="RadioButton">
+          <Grid>
+            <Border x:Name="Bd" CornerRadius="8" Background="Transparent"/>
+            <Border x:Name="Ind" Width="3" Height="16" CornerRadius="2" HorizontalAlignment="Left" Background="{DynamicResource Accent}" Visibility="Collapsed"/>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,8,0">
+              <TextBlock Text="{Binding Tag, RelativeSource={RelativeSource TemplatedParent}}" FontFamily="{StaticResource IconFont}"
+                         FontSize="15" Width="24" VerticalAlignment="Center" Foreground="{TemplateBinding Foreground}"/>
+              <ContentPresenter Margin="8,0,0,0" VerticalAlignment="Center"/>
+            </StackPanel>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+              <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+            </Trigger>
+            <Trigger Property="IsChecked" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+              <Setter TargetName="Ind" Property="Visibility" Value="Visible"/>
+              <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+              <Setter Property="FontWeight" Value="SemiBold"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Toggle switch (CheckBox) -->
+  <Style x:Key="Switch" TargetType="CheckBox">
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="VerticalAlignment" Value="Center"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="CheckBox">
+          <Grid Width="42" Height="24" Background="Transparent">
+            <Border x:Name="Track" CornerRadius="12" Background="{DynamicResource SwitchOff}"/>
+            <Ellipse x:Name="Thumb" Width="16" Height="16" Fill="White" HorizontalAlignment="Left" Margin="4,0,0,0"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+              <Setter TargetName="Track" Property="Background" Value="{DynamicResource Accent}"/>
+              <Setter TargetName="Thumb" Property="Margin" Value="22,0,0,0"/>
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+              <Setter Property="Opacity" Value="0.45"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Text input -->
+  <Style TargetType="TextBox">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="CaretBrush" Value="{DynamicResource Text}"/>
+    <Setter Property="SelectionBrush" Value="{DynamicResource Accent}"/>
+    <Setter Property="Background" Value="{DynamicResource Input}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource InputBorder}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Height" Value="34"/>
+    <Setter Property="Padding" Value="10,0"/>
+    <Setter Property="FontSize" Value="13"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="TextBox">
+          <Border x:Name="Bd" CornerRadius="8" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+            <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center" Focusable="False"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsKeyboardFocused" Value="True">
+              <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Accent}"/>
+            </Trigger>
+            <Trigger Property="IsEnabled" Value="False">
+              <Setter Property="Opacity" Value="0.45"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Drop-downs -->
+  <Style TargetType="ComboBoxItem">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ComboBoxItem">
+          <Border x:Name="Bd" CornerRadius="6" Padding="10,7" Background="Transparent">
+            <ContentPresenter/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentSoft}"/>
+            </Trigger>
+            <Trigger Property="IsHighlighted" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style TargetType="ComboBox">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="Height" Value="34"/>
+    <Setter Property="FontSize" Value="13"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="MaxDropDownHeight" Value="300"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ComboBox">
+          <Grid>
+            <ToggleButton x:Name="Toggle" Focusable="False" ClickMode="Press"
+                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+              <ToggleButton.Template>
+                <ControlTemplate TargetType="ToggleButton">
+                  <Border x:Name="Bd" CornerRadius="8" Background="{DynamicResource Input}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1">
+                    <Path x:Name="Arrow" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,1,12,0" Data="M0,0 L4.5,4.5 L9,0"
+                          Stroke="{DynamicResource Muted}" StrokeThickness="1.6"/>
+                  </Border>
+                  <ControlTemplate.Triggers>
+                    <Trigger Property="IsMouseOver" Value="True">
+                      <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Accent}"/>
+                      <Setter TargetName="Arrow" Property="Stroke" Value="{DynamicResource Accent}"/>
+                    </Trigger>
+                    <Trigger Property="IsChecked" Value="True">
+                      <Setter TargetName="Bd" Property="BorderBrush" Value="{DynamicResource Accent}"/>
+                      <Setter TargetName="Arrow" Property="Stroke" Value="{DynamicResource Accent}"/>
+                    </Trigger>
+                  </ControlTemplate.Triggers>
+                </ControlTemplate>
+              </ToggleButton.Template>
+            </ToggleButton>
+            <ContentPresenter IsHitTestVisible="False" Margin="11,0,30,0" VerticalAlignment="Center" HorizontalAlignment="Left"
+                              Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"/>
+            <Popup x:Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True"
+                   Focusable="False" PopupAnimation="Fade">
+              <Border Margin="0,4,0,0" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                      MaxHeight="{TemplateBinding MaxDropDownHeight}" Background="{DynamicResource Card}"
+                      BorderBrush="{DynamicResource InputBorder}" BorderThickness="1" CornerRadius="8" Padding="4">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                  <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                </ScrollViewer>
+              </Border>
+            </Popup>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsEnabled" Value="False">
+              <Setter Property="Opacity" Value="0.45"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Lists -->
+  <Style TargetType="ListBoxItem">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ListBoxItem">
+          <Border x:Name="Bd" CornerRadius="6" Padding="10,7" Margin="0,0,0,2" Background="Transparent">
+            <ContentPresenter/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource Hover}"/>
+            </Trigger>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter TargetName="Bd" Property="Background" Value="{DynamicResource AccentSoft}"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style TargetType="ListBox">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ListBox">
+          <Border CornerRadius="8" Background="{DynamicResource Input}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1" Padding="4">
+            <ScrollViewer Focusable="False" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+              <ItemsPresenter/>
+            </ScrollViewer>
+          </Border>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Thin scrollbars -->
+  <Style TargetType="ScrollBar">
+    <Setter Property="Width" Value="8"/>
+    <Setter Property="MinWidth" Value="8"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ScrollBar">
+          <Grid Background="Transparent">
+            <Track x:Name="PART_Track" IsDirectionReversed="True">
+              <Track.Thumb>
+                <Thumb>
+                  <Thumb.Template>
+                    <ControlTemplate TargetType="Thumb">
+                      <Border CornerRadius="4" Margin="1,2" Background="{DynamicResource ScrollThumb}"/>
+                    </ControlTemplate>
+                  </Thumb.Template>
+                </Thumb>
+              </Track.Thumb>
+            </Track>
+          </Grid>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <Style TargetType="ToolTip">
+    <Setter Property="Foreground" Value="{DynamicResource Text}"/>
+    <Setter Property="Background" Value="{DynamicResource Card}"/>
+    <Setter Property="BorderBrush" Value="{DynamicResource InputBorder}"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ToolTip">
+          <Border CornerRadius="6" Padding="9,5" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1">
+            <ContentPresenter/>
+          </Border>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+
+  <!-- Color picker sliders -->
+  <Style x:Key="ColorSlider" TargetType="Slider">
+    <Setter Property="Height" Value="24"/>
+    <Setter Property="IsMoveToPointEnabled" Value="True"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Slider">
+          <Grid Background="Transparent">
+            <Border Height="10" CornerRadius="5" VerticalAlignment="Center" Margin="9,0" Background="{TemplateBinding Background}"
+                    BorderBrush="{DynamicResource InputBorder}" BorderThickness="1"/>
+            <Track x:Name="PART_Track">
+              <Track.Thumb>
+                <Thumb>
+                  <Thumb.Template>
+                    <ControlTemplate TargetType="Thumb">
+                      <Ellipse Width="18" Height="18" Fill="White" Stroke="#55000000" StrokeThickness="1"/>
+                    </ControlTemplate>
+                  </Thumb.Template>
+                </Thumb>
+              </Track.Thumb>
+            </Track>
+          </Grid>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+</ResourceDictionary>
+'@
+$mainXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TapForge" Width="940" Height="680" MinWidth="800" MinHeight="580"
+        WindowStartupLocation="CenterScreen" Background="{DynamicResource Chrome}"
+        Foreground="{DynamicResource Text}" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        UseLayoutRounding="True" SnapsToDevicePixels="True" TextOptions.TextFormattingMode="Display">
+  <WindowChrome.WindowChrome>
+    <WindowChrome CaptionHeight="44" ResizeBorderThickness="6" CornerRadius="0" GlassFrameThickness="0" UseAeroCaptionButtons="False"/>
+  </WindowChrome.WindowChrome>
+
+  <Border x:Name="root" Background="{DynamicResource Chrome}">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="44"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <!-- ===== Title bar ===== -->
+      <Grid x:Name="titleBar" Grid.Row="0" Background="Transparent">
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center" Margin="8,0,0,0">
+          <Button x:Name="navSettings" Style="{StaticResource TitleButton}" Content="&#xE713;" ToolTip="Settings"/>
+          <Button x:Name="navClicking" Style="{StaticResource TitleButton}" Content="&#xE962;" ToolTip="Clicking"/>
+          <Button x:Name="navMore" Style="{StaticResource TitleButton}" Content="&#xE81E;" ToolTip="More control"/>
+          <Button x:Name="navPoints" Style="{StaticResource TitleButton}" Content="&#xE707;" ToolTip="Click points"/>
+        </StackPanel>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False">
+          <Image x:Name="brandLogo" Width="24" Height="24" Margin="0,0,8,0" RenderOptions.BitmapScalingMode="HighQuality"/>
+          <TextBlock x:Name="brandTitle" Text="TapForge" FontSize="16" FontWeight="Bold" VerticalAlignment="Center" FontFamily="Segoe UI Variable Display, Segoe UI"/>
+        </StackPanel>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,4,0">
+          <Border x:Name="statusPill" CornerRadius="11" Padding="10,4" Margin="0,0,10,0" Background="{DynamicResource Hover}" VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal">
+              <Ellipse x:Name="statusDot" Width="7" Height="7" Fill="{DynamicResource Good}" VerticalAlignment="Center"/>
+              <TextBlock x:Name="statusText" Text="READY" FontSize="10.5" FontWeight="Bold" Margin="6,0,0,0" Foreground="{DynamicResource Good}" VerticalAlignment="Center"/>
+            </StackPanel>
+          </Border>
+          <Button x:Name="compactButton" Style="{StaticResource TitleButton}" Content="&#xE73F;" ToolTip="Compact mode"/>
+          <Button x:Name="pinButton" Style="{StaticResource TitleButton}" Content="&#xE718;" ToolTip="Keep on top"/>
+          <Button x:Name="minButton" Style="{StaticResource CaptionButton}" Content="&#xE921;" ToolTip="Minimize"/>
+          <Button x:Name="maxButton" Style="{StaticResource CaptionButton}" Content="&#xE922;" ToolTip="Maximize"/>
+          <Button x:Name="closeButton" Style="{StaticResource CloseButton}" Content="&#xE8BB;" ToolTip="Close"/>
+        </StackPanel>
+      </Grid>
+
+      <!-- ===== Body ===== -->
+      <Grid x:Name="body" Grid.Row="1">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Settings sidebar -->
+        <Grid x:Name="sidebar" Grid.Column="0" Width="184" Visibility="Collapsed">
+          <StackPanel Margin="10,6,10,0">
+            <RadioButton x:Name="sideGeneral" Style="{StaticResource SideItem}" Tag="&#xE946;" Content="General"/>
+            <RadioButton x:Name="sideBehavior" Style="{StaticResource SideItem}" Tag="&#xE9E9;" Content="Behavior"/>
+            <RadioButton x:Name="sideAppearance" Style="{StaticResource SideItem}" Tag="&#xE790;" Content="Appearance"/>
+            <RadioButton x:Name="sideKeybinds" Style="{StaticResource SideItem}" Tag="&#xE765;" Content="Keybinds"/>
+            <RadioButton x:Name="sideProcess" Style="{StaticResource SideItem}" Tag="&#xE71D;" Content="Process List"/>
+            <RadioButton x:Name="sidePresets" Style="{StaticResource SideItem}" Tag="&#xE74E;" Content="Presets"/>
+            <RadioButton x:Name="sideMaintenance" Style="{StaticResource SideItem}" Tag="&#xE90F;" Content="Maintenance"/>
+          </StackPanel>
+          <Border VerticalAlignment="Bottom" Margin="12,0,12,14" CornerRadius="12" Padding="12,10" Background="{DynamicResource Card}"
+                  BorderBrush="{DynamicResource CardBorder}" BorderThickness="1">
+            <StackPanel>
+              <StackPanel Orientation="Horizontal">
+                <Image x:Name="sideLogo" Width="22" Height="22" RenderOptions.BitmapScalingMode="HighQuality"/>
+                <TextBlock Text="TapForge" FontWeight="Bold" FontSize="13.5" Margin="8,0,0,0" VerticalAlignment="Center"/>
+              </StackPanel>
+              <TextBlock x:Name="sideVersion" Text="v4.0.0" Style="{StaticResource CardSub}" Margin="0,6,0,0"/>
+              <Button x:Name="sideGithub" Content="View on GitHub" Margin="0,10,0,0" Height="30" FontSize="12"/>
+            </StackPanel>
+          </Border>
+        </Grid>
+
+        <!-- Content area with the accent edge -->
+        <Border x:Name="contentFrame" Grid.Column="1" CornerRadius="14,0,0,0" BorderThickness="1.5,1.5,0,0"
+                BorderBrush="{DynamicResource Accent}" Background="{DynamicResource Bg}">
+          <Grid x:Name="pages">
+
+            <!-- Clicking -->
+            <ScrollViewer x:Name="pageClicking" VerticalScrollBarVisibility="Auto" Padding="16,14,16,4">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="1.2*"/>
+                  <ColumnDefinition Width="12"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <Border Style="{StaticResource Panel}" Margin="0">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Click settings"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Set your click pattern and when to stop."/>
+
+                    <Grid Margin="0,16,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="MOUSE BUTTON"/>
+                        <ComboBox x:Name="buttonPick"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="2">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="CLICK TYPE"/>
+                        <ComboBox x:Name="clickTypePick"/>
+                      </StackPanel>
+                    </Grid>
+
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="SPEED MODE"/>
+                        <ComboBox x:Name="speedMode"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="2">
+                        <TextBlock x:Name="speedValueLabel" Style="{StaticResource FieldLabel}" Text="INTERVAL"/>
+                        <Grid x:Name="intervalRow">
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <ContentControl x:Name="intervalHost" Focusable="False"/>
+                          <ComboBox x:Name="intervalUnit" Grid.Column="1" Width="78" Margin="8,0,0,0"/>
+                        </Grid>
+                        <ContentControl x:Name="rateHost" Focusable="False" Visibility="Collapsed"/>
+                      </StackPanel>
+                    </Grid>
+                    <TextBlock x:Name="speedHint" FontSize="12" Foreground="{DynamicResource Accent}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="12"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="STOP AFTER"/>
+                        <ComboBox x:Name="modePick"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="2">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="LIMIT"/>
+                        <Grid>
+                          <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                          </Grid.ColumnDefinitions>
+                          <ContentControl x:Name="limitHost" Focusable="False"/>
+                          <TextBlock x:Name="limitUnit" Grid.Column="1" Text="clicks" Foreground="{DynamicResource Muted}" VerticalAlignment="Center" Margin="8,0,0,0" MinWidth="50"/>
+                        </Grid>
+                      </StackPanel>
+                    </Grid>
+
+                    <Border Style="{StaticResource Divider}" Margin="0,16,0,12"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Style="{StaticResource Glyph}" Text="&#xE765;" Foreground="{DynamicResource Muted}" FontSize="14"/>
+                        <TextBlock x:Name="hotkeyCaption" Text="F6 start / stop  ·  F7 emergency stop" Foreground="{DynamicResource Muted}" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="12"/>
+                      </StackPanel>
+                      <Button x:Name="editKeysButton" Grid.Column="1" Content="Change keys" Height="28" FontSize="12" Padding="10,0"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Grid.Column="2" Style="{StaticResource Panel}" Margin="0">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Live monitor"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Updates while clicking."/>
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="CLICKS SENT" Margin="0,18,0,2"/>
+                    <TextBlock x:Name="countLabel" Text="0" FontSize="40" FontWeight="Bold" FontFamily="Segoe UI Variable Display, Segoe UI"/>
+                    <Grid Margin="0,12,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="ELAPSED"/>
+                        <TextBlock x:Name="elapsedLabel" Style="{StaticResource StatValue}" Text="00:00:00"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="1">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="ACTUAL SPEED"/>
+                        <TextBlock x:Name="rateLabel" Style="{StaticResource StatValue}" Text="0.0 cps" Foreground="{DynamicResource Accent}"/>
+                      </StackPanel>
+                    </Grid>
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="CURRENT MODE" Margin="0,16,0,6"/>
+                    <TextBlock x:Name="modeLabel" Text="Continuous" FontSize="14" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="messageLabel" Text="Ready when you are." Style="{StaticResource CardSub}" Margin="0,14,0,0"/>
+                  </StackPanel>
+                </Border>
+
+                <Grid Grid.Row="1" Grid.ColumnSpan="3" Margin="0,12,0,12">
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="1.2*"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Button x:Name="startButton" Style="{StaticResource AccentButton}" Height="50" FontSize="14.5">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock x:Name="startGlyph" Style="{StaticResource Glyph}" Text="&#xE768;" FontSize="14"/>
+                      <TextBlock x:Name="startText" Text="Start clicking" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                  </Button>
+                  <Button x:Name="stopButton" Grid.Column="2" Height="50" FontSize="14.5">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Style="{StaticResource Glyph}" Text="&#xE71A;" FontSize="13"/>
+                      <TextBlock Text="Stop" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                    </StackPanel>
+                  </Button>
+                </Grid>
+              </Grid>
+            </ScrollViewer>
+
+            <!-- More control -->
+            <ScrollViewer x:Name="pageMore" VerticalScrollBarVisibility="Auto" Padding="16,14,16,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Input"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="What gets pressed and how the hotkey behaves."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Send a keyboard key"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Press a key instead of clicking the mouse."/>
+                      </StackPanel>
+                      <ComboBox x:Name="keyCodePick" Grid.Column="1" Width="120" Margin="0,0,14,0" VerticalAlignment="Center"/>
+                      <CheckBox x:Name="keyboardMode" Grid.Column="2" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Hotkey behavior"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Toggle starts and stops with one press. Hold clicks only while the key is held."/>
+                      </StackPanel>
+                      <ComboBox x:Name="hotkeyMode" Grid.Column="1" Width="176" VerticalAlignment="Center"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Timing"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Fine-tune each press."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Button hold (duty cycle)"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="How long each press is held, as a percent of the interval. 0 = instant tap."/>
+                      </StackPanel>
+                      <ContentControl x:Name="dutyHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                      <TextBlock Grid.Column="2" Text="%" Foreground="{DynamicResource Muted}" VerticalAlignment="Center" Margin="8,0,0,0" Width="22"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Speed randomization"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Varies each interval by up to this percent so the rhythm is less robotic."/>
+                      </StackPanel>
+                      <ContentControl x:Name="randomHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                      <TextBlock Grid.Column="2" Text="%" Foreground="{DynamicResource Muted}" VerticalAlignment="Center" Margin="8,0,0,0" Width="22"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Screen safety"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Fling the mouse to a corner or edge to stop instantly."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Stop at screen corners"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Corner zone size in pixels."/>
+                      </StackPanel>
+                      <ContentControl x:Name="cornerSizeHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                      <TextBlock Grid.Column="2" Text="px" Foreground="{DynamicResource Muted}" VerticalAlignment="Center" Margin="8,0,14,0" Width="22"/>
+                      <CheckBox x:Name="cornerStop" Grid.Column="3" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Stop at screen edges"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Edge zone size in pixels."/>
+                      </StackPanel>
+                      <ContentControl x:Name="edgeSizeHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                      <TextBlock Grid.Column="2" Text="px" Foreground="{DynamicResource Muted}" VerticalAlignment="Center" Margin="8,0,14,0" Width="22"/>
+                      <CheckBox x:Name="edgeStop" Grid.Column="3" Style="{StaticResource Switch}"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Click points -->
+            <ScrollViewer x:Name="pagePoints" VerticalScrollBarVisibility="Auto" Padding="16,14,16,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Click points"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Pick screen locations to click in sequence. Each point uses your click settings."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Use click points"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="When off, TapForge clicks wherever your cursor is."/>
+                      </StackPanel>
+                      <CheckBox x:Name="pointsEnabled" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Stop when complete"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Stop after every point has been clicked once through."/>
+                      </StackPanel>
+                      <CheckBox x:Name="stopWhenPointsDone" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <Grid>
+                    <Grid.ColumnDefinitions>
+                      <ColumnDefinition Width="*"/>
+                      <ColumnDefinition Width="12"/>
+                      <ColumnDefinition Width="160"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                      <RowDefinition Height="Auto"/>
+                      <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel Grid.ColumnSpan="3" Margin="0,0,0,12">
+                      <TextBlock Style="{StaticResource CardTitle}" Text="Points"/>
+                      <TextBlock x:Name="pointsSummary" Style="{StaticResource CardSub}" Text="No points yet."/>
+                    </StackPanel>
+                    <ListBox x:Name="pointList" Grid.Row="1" Height="210"/>
+                    <StackPanel Grid.Row="1" Grid.Column="2">
+                      <Button x:Name="pickPoint" Style="{StaticResource AccentButton}">
+                        <StackPanel Orientation="Horizontal">
+                          <TextBlock Style="{StaticResource Glyph}" Text="&#xE710;" FontSize="12"/>
+                          <TextBlock Text="Pick point" Margin="8,0,0,0"/>
+                        </StackPanel>
+                      </Button>
+                      <Button x:Name="removePoint" Content="Remove selected" Margin="0,8,0,0"/>
+                      <Button x:Name="clearPoints" Content="Clear all" Margin="0,8,0,0"/>
+                    </StackPanel>
+                  </Grid>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Point defaults"/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Clicks per point"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="How many clicks land on a point before moving to the next."/>
+                      </StackPanel>
+                      <ContentControl x:Name="pointClicksHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="110"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Randomization radius"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Lands each click at a random spot within this many pixels of the point."/>
+                      </StackPanel>
+                      <ContentControl x:Name="pointRadiusHost" Grid.Column="1" Focusable="False" VerticalAlignment="Center"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: General -->
+            <ScrollViewer x:Name="pageGeneral" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="About"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Version and project links."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Orientation="Horizontal">
+                        <Image x:Name="aboutLogo" Width="40" Height="40" RenderOptions.BitmapScalingMode="HighQuality"/>
+                        <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                          <TextBlock Text="TapForge" FontSize="16" FontWeight="Bold"/>
+                          <TextBlock Text="Precision auto-clicker for Windows" Style="{StaticResource CardSub}"/>
+                        </StackPanel>
+                      </StackPanel>
+                      <Button x:Name="githubButton" Grid.Column="1" VerticalAlignment="Center" Padding="12,0">
+                        <StackPanel Orientation="Horizontal">
+                          <TextBlock Style="{StaticResource Glyph}" Text="&#xE8A7;" FontSize="12"/>
+                          <TextBlock Text="GitHub" Margin="8,0,0,0"/>
+                        </StackPanel>
+                      </Button>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Version"/>
+                        <TextBlock x:Name="versionLabel" Text="v4.0.0" FontSize="13" Foreground="{DynamicResource Muted}" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                      </StackPanel>
+                      <Button x:Name="changesButton" Grid.Column="1" Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                          <TextBlock Style="{StaticResource Glyph}" Text="&#xE76C;" FontSize="10"/>
+                          <TextBlock Text="Show changes" Margin="8,0,0,0"/>
+                        </StackPanel>
+                      </Button>
+                      <Button x:Name="checkUpdateButton" Grid.Column="2" Content="Check for update"/>
+                    </Grid>
+                    <TextBlock x:Name="updateStatus" Style="{StaticResource CardSub}" Margin="0,10,0,0" Text=""/>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Usage"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Clicking statistics for all sessions (only stored on this PC)."/>
+                    <TextBlock x:Name="usageEmpty" Text="No session data yet." Foreground="{DynamicResource Muted}" HorizontalAlignment="Center" Margin="0,18,0,8"/>
+                    <Grid x:Name="usageGrid" Margin="0,16,0,2" Visibility="Collapsed">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="TOTAL CLICKS"/>
+                        <TextBlock x:Name="usageClicks" Style="{StaticResource StatValue}" Text="0"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="1">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="SESSIONS"/>
+                        <TextBlock x:Name="usageSessions" Style="{StaticResource StatValue}" Text="0"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="2">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="TIME CLICKING"/>
+                        <TextBlock x:Name="usageTime" Style="{StaticResource StatValue}" Text="0m"/>
+                      </StackPanel>
+                      <StackPanel Grid.Column="3">
+                        <TextBlock Style="{StaticResource FieldLabel}" Text="LAST SESSION"/>
+                        <TextBlock x:Name="usageLast" Style="{StaticResource StatValue}" FontSize="14" Text="-" TextWrapping="Wrap"/>
+                      </StackPanel>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Behavior -->
+            <ScrollViewer x:Name="pageBehavior" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Clicking"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="How TapForge behaves while it runs."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Always on top"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Keep TapForge above other windows."/>
+                      </StackPanel>
+                      <CheckBox x:Name="alwaysTop" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Stop reason alert"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Show a notification when a limit or safety stop ends clicking."/>
+                      </StackPanel>
+                      <CheckBox x:Name="stopAlert" Grid.Column="1" Style="{StaticResource Switch}" IsChecked="True"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Strict hotkey modifiers"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Ignore the start key while Ctrl, Shift, Alt or Windows is held."/>
+                      </StackPanel>
+                      <CheckBox x:Name="strictHotkey" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Stop on Alt+Tab"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Stop clicking when you switch to another window."/>
+                      </StackPanel>
+                      <CheckBox x:Name="stopAltTab" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Extended speed limit"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Allow up to 1000 clicks per second. The game or app may not keep up."/>
+                      </StackPanel>
+                      <CheckBox x:Name="extendedSpeed" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Startup"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Window and sign-in options."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Minimize to tray"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Minimizing or closing hides TapForge in the notification area instead of exiting."/>
+                      </StackPanel>
+                      <CheckBox x:Name="minimizeTray" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Remember window position"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Reopen where you left it, at the same size."/>
+                      </StackPanel>
+                      <CheckBox x:Name="rememberPosition" Grid.Column="1" Style="{StaticResource Switch}" IsChecked="True"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Run on startup"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Start TapForge when you sign in to Windows."/>
+                      </StackPanel>
+                      <CheckBox x:Name="runOnStartup" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Appearance -->
+            <ScrollViewer x:Name="pageAppearance" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Theme"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Light or dark, and what shows at the bottom."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Theme"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Colors for the whole app."/>
+                      </StackPanel>
+                      <ComboBox x:Name="themePick" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Status footer"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Show the active preset and version along the bottom."/>
+                      </StackPanel>
+                      <CheckBox x:Name="footerToggle" Grid.Column="1" Style="{StaticResource Switch}" IsChecked="True"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Accent color"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Used for the window edge, buttons, switches and the logo."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Accent mode"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="One color everywhere, or a different color for each page."/>
+                      </StackPanel>
+                      <ComboBox x:Name="appearanceModePick" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Grid x:Name="accentTargetRow" Margin="0,12,0,0" Visibility="Collapsed">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Page to edit"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="The color below applies to this page."/>
+                      </StackPanel>
+                      <ComboBox x:Name="accentTarget" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <Border x:Name="accentSwatch" Width="36" Height="36" CornerRadius="10" Background="{DynamicResource Accent}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1"/>
+                      <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock x:Name="accentHex" Text="#7B61FF" FontSize="14" FontWeight="SemiBold"/>
+                        <TextBlock Text="Current color" Style="{StaticResource CardSub}"/>
+                      </StackPanel>
+                      <Button x:Name="hueButton" Grid.Column="2" Style="{StaticResource AccentButton}" Content="Custom color..." VerticalAlignment="Center"/>
+                    </Grid>
+                    <WrapPanel x:Name="swatchPanel" Margin="0,14,0,0"/>
+                  </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Icon"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Taskbar and tray icon."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Show active state"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Add a green dot to the taskbar icon while clicking."/>
+                      </StackPanel>
+                      <CheckBox x:Name="activeIcon" Grid.Column="1" Style="{StaticResource Switch}" IsChecked="True"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Icon background"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Put the logo on a dark or light tile so it stands out on your taskbar."/>
+                      </StackPanel>
+                      <ComboBox x:Name="iconTheme" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Logo color"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Tint the logo with your accent color, or keep its original colors."/>
+                      </StackPanel>
+                      <ComboBox x:Name="iconColor" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Keybinds -->
+            <ScrollViewer x:Name="pageKeybinds" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Keybinds"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Global shortcuts. They work while TapForge is minimized or a game is in front."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Start / stop clicking"/>
+                        <TextBlock x:Name="startKeyHint" Style="{StaticResource RowSub}" Text="Press once to start, again to stop (or hold, if set on More control)."/>
+                      </StackPanel>
+                      <ComboBox x:Name="keyPick" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Emergency stop"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Always stops the click engine immediately."/>
+                      </StackPanel>
+                      <ComboBox x:Name="emergencyKey" Grid.Column="1" Width="170" VerticalAlignment="Center"/>
+                    </Grid>
+                    <TextBlock x:Name="keyWarning" Style="{StaticResource CardSub}" Foreground="{DynamicResource Warn}" Margin="0,12,0,0" Visibility="Collapsed"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Style="{StaticResource Glyph}" Text="&#xE946;" Foreground="{DynamicResource Accent}" FontSize="15" VerticalAlignment="Top" Margin="0,1,0,0"/>
+                    <TextBlock Style="{StaticResource CardSub}" Margin="10,0,0,0" MaxWidth="560"
+                               Text="Mouse 4 and Mouse 5 (the side buttons) work as hotkeys too. Choose Toggle or Hold behavior on the More control page."/>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Process list -->
+            <ScrollViewer x:Name="pageProcess" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Process list"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Optionally restrict clicks to one app. Clicking pauses whenever another window is in front."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Only click in the selected app"/>
+                        <TextBlock x:Name="processSelectedLabel" Style="{StaticResource RowSub}" Text="No app selected."/>
+                      </StackPanel>
+                      <CheckBox x:Name="filterProcess" Grid.Column="1" Style="{StaticResource Switch}"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Panel}">
+                  <Grid>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <Grid Margin="0,0,0,12">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource CardTitle}" Text="Open windows"/>
+                        <TextBlock Style="{StaticResource CardSub}" Text="Select the app TapForge should click in."/>
+                      </StackPanel>
+                      <Button x:Name="refreshProcesses" Grid.Column="1" VerticalAlignment="Center">
+                        <StackPanel Orientation="Horizontal">
+                          <TextBlock Style="{StaticResource Glyph}" Text="&#xE72C;" FontSize="12"/>
+                          <TextBlock Text="Refresh" Margin="8,0,0,0"/>
+                        </StackPanel>
+                      </Button>
+                    </Grid>
+                    <ListBox x:Name="processList" Grid.Row="1" Height="290"/>
+                  </Grid>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Presets -->
+            <ScrollViewer x:Name="pagePresets" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Save a preset"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Stores your click, speed, input and safety settings under a name."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <TextBox x:Name="presetName"/>
+                      <Button x:Name="presetSave" Grid.Column="1" Style="{StaticResource AccentButton}" Content="Save current" Margin="10,0,0,0"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Panel}">
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="12"/><ColumnDefinition Width="150"/></Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                    <StackPanel Grid.ColumnSpan="3" Margin="0,0,0,12">
+                      <TextBlock Style="{StaticResource CardTitle}" Text="Your presets"/>
+                      <TextBlock x:Name="presetSummary" Style="{StaticResource CardSub}" Text="Double-click a preset to load it."/>
+                    </StackPanel>
+                    <ListBox x:Name="presetList" Grid.Row="1" Height="240"/>
+                    <StackPanel Grid.Row="1" Grid.Column="2">
+                      <Button x:Name="presetLoad" Style="{StaticResource AccentButton}" Content="Load selected"/>
+                      <Button x:Name="presetDelete" Content="Delete selected" Margin="0,8,0,0"/>
+                    </StackPanel>
+                  </Grid>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+
+            <!-- Settings: Maintenance -->
+            <ScrollViewer x:Name="pageMaintenance" VerticalScrollBarVisibility="Auto" Padding="14,14,14,4" Visibility="Collapsed">
+              <StackPanel>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Updates"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="TapForge checks GitHub for new releases when it opens."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Check for updates"/>
+                        <TextBlock x:Name="maintUpdateStatus" Style="{StaticResource RowSub}" Text=""/>
+                      </StackPanel>
+                      <Button x:Name="publishUpdateButton" Grid.Column="1" Content="Publish update" Margin="0,0,8,0" VerticalAlignment="Center" Visibility="Collapsed"/>
+                      <Button x:Name="maintCheckButton" Grid.Column="2" Style="{StaticResource AccentButton}" Content="Check now" VerticalAlignment="Center"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Panel}">
+                  <StackPanel>
+                    <TextBlock Style="{StaticResource CardTitle}" Text="Settings and data"/>
+                    <TextBlock Style="{StaticResource CardSub}" Text="Everything is stored locally in your AppData folder."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Reset all settings"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Return every option to its default. Presets are kept."/>
+                      </StackPanel>
+                      <Button x:Name="resetSettings" Grid.Column="1" Content="Reset settings" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Reset usage data"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Clear the statistics shown on the General page."/>
+                      </StackPanel>
+                      <Button x:Name="resetUsage" Grid.Column="1" Content="Reset usage" VerticalAlignment="Center"/>
+                    </Grid>
+                    <Border Style="{StaticResource Divider}"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <StackPanel>
+                        <TextBlock Style="{StaticResource RowTitle}" Text="Diagnostics"/>
+                        <TextBlock Style="{StaticResource RowSub}" Text="Error log and a system report for troubleshooting."/>
+                      </StackPanel>
+                      <Button x:Name="openDiagnostics" Grid.Column="1" Content="Open folder" Margin="0,0,8,0" VerticalAlignment="Center"/>
+                      <Button x:Name="exportDiagnostics" Grid.Column="2" Content="Export report" VerticalAlignment="Center"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+          </Grid>
+        </Border>
+
+        <!-- Compact mode -->
+        <Border x:Name="compactPanel" Grid.ColumnSpan="2" Visibility="Collapsed" Background="{DynamicResource Bg}"
+                CornerRadius="14,0,0,0" BorderThickness="1.5,1.5,0,0" BorderBrush="{DynamicResource Accent}" Padding="14,12">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="110"/>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="10"/>
+              <ColumnDefinition Width="110"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Text="CPS" Style="{StaticResource FieldLabel}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <ContentControl x:Name="quickRateHost" Grid.Column="1" Focusable="False"/>
+            <Button x:Name="quickStart" Grid.Column="2" Style="{StaticResource AccentButton}" Margin="10,0,0,0" Height="36">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="quickGlyph" Style="{StaticResource Glyph}" Text="&#xE768;" FontSize="12"/>
+                <TextBlock x:Name="quickText" Text="Start" Margin="8,0,0,0"/>
+              </StackPanel>
+            </Button>
+            <Button x:Name="quickStop" Grid.Column="4" Height="36">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Style="{StaticResource Glyph}" Text="&#xE71A;" FontSize="11"/>
+                <TextBlock Text="Stop" Margin="8,0,0,0"/>
+              </StackPanel>
+            </Button>
+            <Grid Grid.Row="1" Grid.ColumnSpan="5" Margin="0,10,0,0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBlock x:Name="quickHotkey" Text="F6 start / stop  ·  F7 emergency stop" Foreground="{DynamicResource Muted}" FontSize="12"/>
+              <TextBlock x:Name="quickCount" Grid.Column="1" Text="0 clicks" Foreground="{DynamicResource Muted}" FontSize="12"/>
+            </Grid>
+          </Grid>
+        </Border>
+      </Grid>
+
+      <!-- ===== Footer ===== -->
+      <Grid x:Name="footer" Grid.Row="2" Height="28">
+        <TextBlock x:Name="footerLeft" Text="No preset active" Foreground="{DynamicResource Muted}" FontSize="11.5" VerticalAlignment="Center" Margin="14,0,0,0"/>
+        <TextBlock x:Name="footerRight" Text="v4.0.0" Foreground="{DynamicResource Muted}" FontSize="11.5" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="0,0,14,0"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+$dialogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TapForge" Width="420" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        Foreground="{DynamicResource Text}" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Border Margin="14" CornerRadius="12" Background="{DynamicResource Card}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1" Padding="20,18">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="18" ShadowDepth="2" Opacity="0.45" Color="Black"/>
+    </Border.Effect>
+    <StackPanel>
+      <StackPanel Orientation="Horizontal">
+        <Border Width="3" Height="16" CornerRadius="2" Background="{DynamicResource Accent}" VerticalAlignment="Center"/>
+        <TextBlock x:Name="dlgTitle" Text="TapForge" FontSize="15" FontWeight="SemiBold" Margin="10,0,0,0" VerticalAlignment="Center"/>
+      </StackPanel>
+      <TextBlock x:Name="dlgMessage" Margin="0,12,0,0" TextWrapping="Wrap" Foreground="{DynamicResource Muted}" LineHeight="19"/>
+      <TextBox x:Name="dlgInput" Margin="0,14,0,0" Visibility="Collapsed"/>
+      <StackPanel x:Name="dlgButtons" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0"/>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+$colorXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Accent color" Width="400" SizeToContent="Height" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" ShowInTaskbar="False" WindowStartupLocation="CenterOwner"
+        Foreground="{DynamicResource Text}" FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Border Margin="14" CornerRadius="12" Background="{DynamicResource Card}" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1" Padding="20,18">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="18" ShadowDepth="2" Opacity="0.45" Color="Black"/>
+    </Border.Effect>
+    <StackPanel>
+      <TextBlock Text="Choose accent color" FontSize="15" FontWeight="SemiBold"/>
+      <Grid Margin="0,14,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Border x:Name="cpPreview" Width="56" Height="56" CornerRadius="12" BorderBrush="{DynamicResource InputBorder}" BorderThickness="1"/>
+        <StackPanel Grid.Column="1" Margin="14,0,0,0" VerticalAlignment="Center">
+          <TextBlock Text="HEX" Style="{StaticResource FieldLabel}"/>
+          <TextBox x:Name="cpHex" Width="130" HorizontalAlignment="Left"/>
+        </StackPanel>
+      </Grid>
+      <TextBlock Text="HUE" Style="{StaticResource FieldLabel}" Margin="0,16,0,2"/>
+      <Slider x:Name="cpHue" Style="{StaticResource ColorSlider}" Minimum="0" Maximum="360">
+        <Slider.Background>
+          <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+            <GradientStop Color="#FF0000" Offset="0"/>
+            <GradientStop Color="#FFFF00" Offset="0.1667"/>
+            <GradientStop Color="#00FF00" Offset="0.3333"/>
+            <GradientStop Color="#00FFFF" Offset="0.5"/>
+            <GradientStop Color="#0000FF" Offset="0.6667"/>
+            <GradientStop Color="#FF00FF" Offset="0.8333"/>
+            <GradientStop Color="#FF0000" Offset="1"/>
+          </LinearGradientBrush>
+        </Slider.Background>
+      </Slider>
+      <TextBlock Text="SATURATION" Style="{StaticResource FieldLabel}" Margin="0,12,0,2"/>
+      <Slider x:Name="cpSat" Style="{StaticResource ColorSlider}" Minimum="0" Maximum="100"/>
+      <TextBlock Text="BRIGHTNESS" Style="{StaticResource FieldLabel}" Margin="0,12,0,2"/>
+      <Slider x:Name="cpVal" Style="{StaticResource ColorSlider}" Minimum="0" Maximum="100"/>
+      <WrapPanel x:Name="cpSwatches" Margin="0,14,0,0"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+        <Button x:Name="cpCancel" Content="Cancel" Width="100"/>
+        <Button x:Name="cpApply" Style="{StaticResource AccentButton}" Content="Apply" Width="100" Margin="8,0,0,0"/>
+      </StackPanel>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+
+# ---------------------------------------------------------------------------
+# TapForge 4 - WPF interface
+# Loaded by TapForge.exe (or: powershell -STA -File AutoClicker.ps1).
+# Settings, presets and usage data live in %LOCALAPPDATA%\TapForge.
+# ---------------------------------------------------------------------------
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms, System.Drawing
+
+$script:dataDir = Join-Path $env:LOCALAPPDATA 'TapForge'
+$script:diagDir = Join-Path $script:dataDir 'Diagnostics'
+$script:presetDirectory = Join-Path $script:dataDir 'Presets'
+foreach ($d in @($script:dataDir, $script:diagDir, $script:presetDirectory)) { [void](New-Item -ItemType Directory -Force -Path $d -ErrorAction SilentlyContinue) }
+$script:logFile = Join-Path $script:diagDir 'tapforge.log'
+$script:settingsFile = Join-Path $script:dataDir 'settings.json'
+$script:windowStateFile = Join-Path $script:dataDir 'window.json'
+$script:usageFile = Join-Path $script:dataDir 'usage.json'
+function Write-TFLog([string]$message) {
+    try { Add-Content -LiteralPath $script:logFile -Value ('{0}  {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $message) -Encoding UTF8 } catch { }
+}
+
+$script:mid = [string][char]0x00B7
+$script:ell = [string][char]0x2026
+
+try {
+# ===== Native code =========================================================
+if (-not ('ClickNative' -as [type])) {
+    Add-Type -TypeDefinition $engineSource -ReferencedAssemblies @('System.Windows.Forms.dll', 'System.Drawing.dll')
+}
+if (-not ('TapForgeUI.NumberBox' -as [type])) {
+    $wpfRefs = @(
+        [System.Windows.Window].Assembly.Location,
+        [System.Windows.Media.Brush].Assembly.Location,
+        [System.Windows.DependencyObject].Assembly.Location,
+        [System.Xaml.XamlReader].Assembly.Location
+    )
+    Add-Type -TypeDefinition $uiSource -ReferencedAssemblies $wpfRefs
+}
+[TapForgeShell]::EnableDpiAwareness()
+
+# ===== Application + theme resources =======================================
+$script:app = [System.Windows.Application]::Current
+if (-not $script:app) {
+    $script:app = [System.Windows.Application]::new()
+    $script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+}
+$script:app.Resources = [System.Windows.Markup.XamlReader]::Parse($resourcesXaml)
+$script:app.Add_DispatcherUnhandledException({
+    param($s, $e)
+    Write-TFLog ('UI error: ' + $e.Exception.ToString())
+    $e.Handled = $true
+})
+
+function ConvertTo-MediaColor([string]$hex) {
+    try { return [System.Windows.Media.Color]([System.Windows.Media.ColorConverter]::ConvertFromString($hex)) }
+    catch { return [System.Windows.Media.Color]::FromRgb(123, 97, 255) }
+}
+function ConvertTo-Hex([System.Windows.Media.Color]$c) { '#{0:X2}{1:X2}{2:X2}' -f $c.R, $c.G, $c.B }
+function Test-Hex([string]$hex) { $hex -match '^#[0-9A-Fa-f]{6}$' }
+function Set-Brush([string]$key, [System.Windows.Media.Color]$color) {
+    $b = [System.Windows.Media.SolidColorBrush]::new($color); $b.Freeze()
+    $script:app.Resources[$key] = $b
+}
+function New-Brush([string]$hex) { $b = [System.Windows.Media.SolidColorBrush]::new((ConvertTo-MediaColor $hex)); $b.Freeze(); $b }
+
+$script:palettes = @{
+    Dark  = @{ Bg = '#0E0E10'; Chrome = '#151517'; Card = '#1A1A1D'; CardBorder = '#2A2A2F'; Input = '#222226'; InputBorder = '#34343B'; Hover = '#28282D'; Text = '#F2F2F5'; Muted = '#9A9AA5'; SwitchOff = '#3A3A42'; ScrollThumb = '#3A3A42' }
+    Light = @{ Bg = '#F4F5F8'; Chrome = '#E8EAEF'; Card = '#FFFFFF'; CardBorder = '#DDE0E7'; Input = '#F6F7F9'; InputBorder = '#CDD1DA'; Hover = '#E7E9EF'; Text = '#1B1F29'; Muted = '#5F6675'; SwitchOff = '#C5CAD4'; ScrollThumb = '#C5CAD4' }
+}
+$script:swatches = @('#7B61FF', '#A855F7', '#D946EF', '#EC4899', '#F43F5E', '#F97316', '#EAB308', '#22C55E', '#14B8A6', '#0EA5E9', '#3B82F6', '#94A3B8')
+
+# ===== Window ==============================================================
+$script:window = [System.Windows.Markup.XamlReader]::Parse($mainXaml)
+$window = $script:window
+$script:ui = @{}
+foreach ($m in [regex]::Matches($mainXaml, 'x:Name="([^"]+)"')) { $script:ui[$m.Groups[1].Value] = $window.FindName($m.Groups[1].Value) }
+$ui = $script:ui
+
+# TapForge.exe passes its own path in. The script itself may live in
+# %LOCALAPPDATA%\TapForge\App (single-file build) or beside the exe (dev copy).
+$script:exePath = if ($global:TapForgeExePath -and (Test-Path -LiteralPath ([string]$global:TapForgeExePath))) { [string]$global:TapForgeExePath } else { Join-Path $PSScriptRoot 'TapForge.exe' }
+$script:exeDir = Split-Path -Parent $script:exePath
+$script:versionFile = Join-Path $PSScriptRoot 'VERSION'
+$script:appVersion = '4.0.0'
+if (Test-Path -LiteralPath $script:versionFile) { try { $script:appVersion = (Get-Content -LiteralPath $script:versionFile -Raw).Trim() } catch { } }
+foreach ($n in @('versionLabel', 'sideVersion', 'footerRight')) { $ui[$n].Text = 'v' + $script:appVersion }
+$script:repoUrl = 'https://github.com/saberapexyt-commits/TapForge'
+
+function Set-Items($combo, [string[]]$items) {
+    $combo.Items.Clear()
+    foreach ($i in $items) { [void]$combo.Items.Add($i) }
+    if ($combo.Items.Count -gt 0) { $combo.SelectedIndex = 0 }
+}
+function Set-Index($combo, $index) {
+    $i = 0; try { $i = [int]$index } catch { }
+    $combo.SelectedIndex = [Math]::Max(0, [Math]::Min($combo.Items.Count - 1, $i))
+}
+function On-Toggle($checkBox, [scriptblock]$action) { $checkBox.Add_Checked($action); $checkBox.Add_Unchecked($action) }
+function Is-On($checkBox) { $checkBox.IsChecked -eq $true }
+
+$script:keyMap = [ordered]@{
+    F1 = 0x70; F2 = 0x71; F3 = 0x72; F4 = 0x73; F5 = 0x74; F6 = 0x75; F7 = 0x76; F8 = 0x77; F9 = 0x78; F10 = 0x79; F11 = 0x7A; F12 = 0x7B
+    'Mouse 4' = 0x05; 'Mouse 5' = 0x06; Insert = 0x2D; Home = 0x24; End = 0x23; 'Page Up' = 0x21; 'Page Down' = 0x22
+    Pause = 0x13; 'Scroll Lock' = 0x91; 'Tilde (~)' = 0xC0
+}
+$script:keyNames = [string[]]@($script:keyMap.Keys)
+$script:sendKeys = [ordered]@{ Space = 0x20; Enter = 0x0D; A = 0x41; F = 0x46; E = 0x45; Q = 0x51; R = 0x52; W = 0x57; S = 0x53; D = 0x44; '1' = 0x31; '2' = 0x32; '3' = 0x33 }
+$script:accentPages = @('Clicking', 'More control', 'Click Points', 'General', 'Behavior', 'Appearance', 'Keybinds', 'Process List', 'Presets', 'Maintenance')
+$script:pageAccentKey = @{ Clicking = 'Clicking'; More = 'More control'; Points = 'Click Points'; General = 'General'; Behavior = 'Behavior'; Appearance = 'Appearance'; Keybinds = 'Keybinds'; Process = 'Process List'; Presets = 'Presets'; Maintenance = 'Maintenance' }
+
+Set-Items $ui.buttonPick @('Left click', 'Right click', 'Middle click')
+Set-Items $ui.clickTypePick @('Single click', 'Double click')
+Set-Items $ui.speedMode @('Interval', 'Clicks per second')
+Set-Items $ui.intervalUnit @('ms', 'sec', 'min')
+Set-Items $ui.modePick @('Until stopped', 'Number of clicks', 'Time limit')
+Set-Items $ui.keyCodePick ([string[]]@($script:sendKeys.Keys))
+Set-Items $ui.hotkeyMode @('Toggle', 'Hold while pressed')
+Set-Items $ui.themePick @('Dark', 'Light')
+Set-Items $ui.appearanceModePick @('One color', 'Per page')
+Set-Items $ui.accentTarget $script:accentPages
+Set-Items $ui.iconTheme @('No tile', 'Dark tile', 'Light tile')
+Set-Items $ui.iconColor @('Match accent', 'Original colors')
+Set-Items $ui.keyPick $script:keyNames
+Set-Items $ui.emergencyKey $script:keyNames
+$ui.keyPick.SelectedItem = 'F6'; $ui.emergencyKey.SelectedItem = 'F7'
+
+function New-NumberBox($target, [double]$min, [double]$max, [int]$places, [double]$step, [double]$value) {
+    $nb = [TapForgeUI.NumberBox]::new()
+    $nb.Configure($min, $max, $places, $step, $value)
+    $target.Content = $nb
+    $nb
+}
+$script:interval = New-NumberBox $ui.intervalHost 1 3600000 0 10 100
+$script:rate = New-NumberBox $ui.rateHost 0.1 500 1 1 10
+$script:limit = New-NumberBox $ui.limitHost 1 10000000 0 10 100
+$script:duty = New-NumberBox $ui.dutyHost 0 100 0 5 0
+$script:randomize = New-NumberBox $ui.randomHost 0 90 0 5 0
+$script:cornerSize = New-NumberBox $ui.cornerSizeHost 10 500 0 5 50
+$script:edgeSize = New-NumberBox $ui.edgeSizeHost 5 300 0 5 40
+$script:pointClicks = New-NumberBox $ui.pointClicksHost 1 9999 0 1 1
+$script:pointRadius = New-NumberBox $ui.pointRadiusHost 0 1000 0 1 0
+$script:quickRate = New-NumberBox $ui.quickRateHost 0.1 500 1 1 10
+$interval = $script:interval; $rate = $script:rate; $limit = $script:limit; $duty = $script:duty; $randomize = $script:randomize
+$cornerSize = $script:cornerSize; $edgeSize = $script:edgeSize; $pointClicks = $script:pointClicks; $pointRadius = $script:pointRadius; $quickRate = $script:quickRate
+
+# ===== Logo + icons ========================================================
+$script:logoBase = $null
+try {
+    $logoPath = Join-Path $PSScriptRoot 'TapForgeLogo.png'
+    if (Test-Path -LiteralPath $logoPath) {
+        $raw = [System.Drawing.Bitmap]::FromFile($logoPath)
+        try {
+            $script:logoBase = [System.Drawing.Bitmap]::new(256, 256, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $g = [System.Drawing.Graphics]::FromImage($script:logoBase)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $scale = [Math]::Min(256.0 / $raw.Width, 256.0 / $raw.Height)
+            $w = [int]($raw.Width * $scale); $h = [int]($raw.Height * $scale)
+            $g.DrawImage($raw, [int]((256 - $w) / 2), [int]((256 - $h) / 2), $w, $h)
+            $g.Dispose()
+        } finally { $raw.Dispose() }
+    }
+} catch { Write-TFLog ('Logo load failed: ' + $_.Exception.Message) }
+
+function ConvertTo-ImageSource([System.Drawing.Bitmap]$bitmap) {
+    $ms = [System.IO.MemoryStream]::new()
+    $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $ms.Position = 0
+    $bi = [System.Windows.Media.Imaging.BitmapImage]::new()
+    $bi.BeginInit(); $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad; $bi.StreamSource = $ms; $bi.EndInit(); $bi.Freeze()
+    $ms.Dispose()
+    $bi
+}
+function New-PlatedLogo([System.Drawing.Bitmap]$logo, [bool]$light) {
+    $out = [System.Drawing.Bitmap]::new(256, 256, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($out)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $path = [System.Drawing.Drawing2D.GraphicsPath]::new(); $d = 72
+    $path.AddArc(0, 0, $d, $d, 180, 90); $path.AddArc(255 - $d, 0, $d, $d, 270, 90)
+    $path.AddArc(255 - $d, 255 - $d, $d, $d, 0, 90); $path.AddArc(0, 255 - $d, $d, $d, 90, 90); $path.CloseFigure()
+    $fill = if ($light) { [System.Drawing.Color]::FromArgb(243, 244, 247) } else { [System.Drawing.Color]::FromArgb(24, 24, 27) }
+    $brush = [System.Drawing.SolidBrush]::new($fill)
+    $g.FillPath($brush, $path)
+    $g.DrawImage($logo, 30, 30, 196, 196)
+    $brush.Dispose(); $path.Dispose(); $g.Dispose()
+    $out
+}
+$script:activeOverlay = $null
+try {
+    $dot = [System.Windows.Media.GeometryDrawing]::new((New-Brush '#22C55E'), [System.Windows.Media.Pen]::new((New-Brush '#FFFFFF'), 1.5), [System.Windows.Media.EllipseGeometry]::new([System.Windows.Point]::new(8, 8), 6.5, 6.5))
+    $script:activeOverlay = [System.Windows.Media.DrawingImage]::new($dot); $script:activeOverlay.Freeze()
+    $window.TaskbarItemInfo = [System.Windows.Shell.TaskbarItemInfo]::new()
+} catch { }
+
+function Update-Icons {
+    if (-not $script:logoBase) { return }
+    try {
+        $mc = ConvertTo-MediaColor (Get-CurrentAccentHex)
+        $tinted = if ($ui.iconColor.SelectedIndex -eq 1) { $script:logoBase.Clone() } else { [LogoColorizer]::Tint($script:logoBase, [System.Drawing.Color]::FromArgb($mc.R, $mc.G, $mc.B)) }
+        $src = ConvertTo-ImageSource $tinted
+        foreach ($n in @('brandLogo', 'sideLogo', 'aboutLogo')) { $ui[$n].Source = $src }
+        $plate = $ui.iconTheme.SelectedIndex
+        $iconBitmap = if ($plate -le 0) { $tinted } else { New-PlatedLogo $tinted ($plate -eq 2) }
+        $window.Icon = ConvertTo-ImageSource $iconBitmap
+        $newIcon = [LogoColorizer]::MakeIcon($iconBitmap)
+        $oldIcon = $script:trayIconImage; $script:trayIconImage = $newIcon
+        if ($script:trayIcon) { $script:trayIcon.Icon = $newIcon }
+        if ($oldIcon) { $oldIcon.Dispose() }
+        if (-not [object]::ReferenceEquals($iconBitmap, $tinted)) { $iconBitmap.Dispose() }
+        $tinted.Dispose()
+    } catch { Write-TFLog ('Icon update failed: ' + $_.Exception.Message) }
+}
+function Update-ActiveOverlay {
+    if (-not $window.TaskbarItemInfo) { return }
+    $window.TaskbarItemInfo.Overlay = if ($script:running -and (Is-On $ui.activeIcon)) { $script:activeOverlay } else { $null }
+}
+
+# ===== Theme + accent ======================================================
+$script:globalAccent = '#7B61FF'
+$script:pageAccents = @{}
+foreach ($p in $script:accentPages) { $script:pageAccents[$p] = '#7B61FF' }
+$script:appliedAccent = $null
+$script:lightTheme = $false
+$script:currentPage = 'Clicking'
+$script:lastSettingsPage = 'General'
+
+function Get-CurrentAccentHex {
+    if ($ui.appearanceModePick.SelectedIndex -eq 1) {
+        $k = $script:pageAccentKey[$script:currentPage]
+        if ($k -and $script:pageAccents[$k]) { return $script:pageAccents[$k] }
+    }
+    $script:globalAccent
+}
+function Get-EditedAccent {
+    if ($ui.appearanceModePick.SelectedIndex -eq 1 -and $ui.accentTarget.SelectedItem) { return $script:pageAccents[[string]$ui.accentTarget.SelectedItem] }
+    $script:globalAccent
+}
+function Update-AccentUi {
+    $hex = Get-EditedAccent
+    $ui.accentHex.Text = $hex.ToUpper()
+    $ui.accentSwatch.Background = New-Brush $hex
+    $ui.accentTargetRow.Visibility = if ($ui.appearanceModePick.SelectedIndex -eq 1) { 'Visible' } else { 'Collapsed' }
+}
+function Apply-Accent([switch]$Force) {
+    $hex = Get-CurrentAccentHex
+    Update-AccentUi
+    if (-not $Force -and $hex -eq $script:appliedAccent) { return }
+    $script:appliedAccent = $hex
+    $c = ConvertTo-MediaColor $hex
+    Set-Brush 'Accent' $c
+    Set-Brush 'AccentSoft' ([System.Windows.Media.Color]::FromArgb(0x38, $c.R, $c.G, $c.B))
+    $lum = (0.2126 * $c.R + 0.7152 * $c.G + 0.0722 * $c.B) / 255
+    Set-Brush 'OnAccent' $(if ($lum -gt 0.7) { ConvertTo-MediaColor '#111114' } else { [System.Windows.Media.Colors]::White })
+    Update-Icons
+}
+function Set-EditedAccent([string]$hex) {
+    if (-not (Test-Hex $hex)) { return }
+    $hex = $hex.ToUpper()
+    if ($ui.appearanceModePick.SelectedIndex -eq 1 -and $ui.accentTarget.SelectedItem) {
+        $script:pageAccents[[string]$ui.accentTarget.SelectedItem] = $hex
+    } else {
+        $script:globalAccent = $hex
+        foreach ($k in @($script:pageAccents.Keys)) { $script:pageAccents[$k] = $hex }
+    }
+    Apply-Accent -Force
+}
+function Apply-Theme {
+    $name = if ($ui.themePick.SelectedIndex -eq 1) { 'Light' } else { 'Dark' }
+    $script:lightTheme = ($name -eq 'Light')
+    $p = $script:palettes[$name]
+    foreach ($k in $p.Keys) { Set-Brush $k (ConvertTo-MediaColor $p[$k]) }
+    if ($script:hwnd) { [TapForgeShell]::StyleWindow($script:hwnd, -not $script:lightTheme) }
+}
+
+foreach ($hex in $script:swatches) {
+    $sw = [System.Windows.Controls.Border]::new()
+    $sw.Width = 28; $sw.Height = 28; $sw.CornerRadius = [System.Windows.CornerRadius]::new(14)
+    $sw.Margin = [System.Windows.Thickness]::new(0, 0, 8, 8); $sw.Background = New-Brush $hex
+    $sw.Cursor = [System.Windows.Input.Cursors]::Hand; $sw.Tag = $hex; $sw.ToolTip = $hex
+    $sw.Add_MouseLeftButtonUp({ param($s, $e) Set-EditedAccent ([string]$s.Tag) })
+    [void]$ui.swatchPanel.Children.Add($sw)
+}
+
+# ===== Speed + limits ======================================================
+$script:intervalMs = 100.0
+$script:unitFactors = @(1.0, 1000.0, 60000.0)
+$script:unitConfigs = @(@(1, 3600000, 0, 10), @(0.001, 3600, 3, 0.1), @(0.00002, 60, 5, 0.1))
+$script:syncingSpeed = $false
+
+function Show-IntervalInUnit {
+    $i = [Math]::Max(0, $ui.intervalUnit.SelectedIndex); $c = $script:unitConfigs[$i]
+    $interval.Configure($c[0], $c[1], $c[2], $c[3], $script:intervalMs / $script:unitFactors[$i])
+}
+function Get-ClickPeriodMs {
+    if ($ui.speedMode.SelectedIndex -eq 1 -and $rate.Value -gt 0) { return 1000.0 / $rate.Value }
+    [Math]::Max(1.0, $script:intervalMs)
+}
+function Get-IntervalMilliseconds { [long][Math]::Max(1, [Math]::Round($script:intervalMs)) }
+function Format-Number([double]$v) {
+    if ($v -ge 100) { return $v.ToString('N0') }
+    if ($v -ge 10) { return $v.ToString('0.#') }
+    $v.ToString('0.##')
+}
+function Update-SpeedUi {
+    $cps = ($ui.speedMode.SelectedIndex -eq 1)
+    $ui.intervalRow.Visibility = if ($cps) { 'Collapsed' } else { 'Visible' }
+    $ui.rateHost.Visibility = if ($cps) { 'Visible' } else { 'Collapsed' }
+    $ui.speedValueLabel.Text = if ($cps) { 'CLICKS PER SECOND' } else { 'INTERVAL' }
+    $ms = Get-ClickPeriodMs
+    $hint = if ($cps) { '= ' + (Format-Number $ms) + ' ms between clicks' } else { '= ' + (Format-Number (1000.0 / $ms)) + ' clicks per second' }
+    if ($cps -and $rate.Value -ge $rate.Maximum -and -not (Is-On $ui.extendedSpeed)) { $hint += "   $($script:mid)   Turn on Extended speed limit (Settings > Behavior) for up to 1000" }
+    $ui.speedHint.Text = $hint
+    if (-not $script:syncingSpeed) {
+        $script:syncingSpeed = $true
+        $quickRate.SetQuiet([Math]::Round(1000.0 / $ms, 1))
+        $script:syncingSpeed = $false
+    }
+}
+function Update-RateLimit {
+    $max = if (Is-On $ui.extendedSpeed) { 1000 } else { 500 }
+    $rate.Maximum = $max; $quickRate.Maximum = $max
+    Update-SpeedUi
+}
+function Get-ModeText {
+    switch ($ui.modePick.SelectedIndex) {
+        1 { return ('Stop after {0:N0} clicks' -f $limit.Value) }
+        2 { return ('Stop after {0:N0} seconds' -f $limit.Value) }
+        default { return 'Continuous' }
+    }
+}
+function Update-ModeUi {
+    $i = $ui.modePick.SelectedIndex
+    $ui.limitUnit.Text = @('', 'clicks', 'seconds')[[Math]::Max(0, $i)]
+    $limit.IsEnabled = ($i -gt 0)
+    if (-not $script:running) { $ui.modeLabel.Text = Get-ModeText }
+}
+
+$interval.add_ValueChanged({
+    $i = [Math]::Max(0, $ui.intervalUnit.SelectedIndex)
+    $script:intervalMs = [Math]::Max(1.0, $interval.Value * $script:unitFactors[$i])
+    Update-SpeedUi
+})
+$ui.intervalUnit.Add_SelectionChanged({ Show-IntervalInUnit; Update-SpeedUi })
+$ui.speedMode.Add_SelectionChanged({ Update-SpeedUi })
+$rate.add_ValueChanged({ Update-SpeedUi })
+$quickRate.add_ValueChanged({
+    if ($script:syncingSpeed) { return }
+    $script:syncingSpeed = $true
+    $ui.speedMode.SelectedIndex = 1
+    $rate.Value = $quickRate.Value
+    $script:syncingSpeed = $false
+    Update-SpeedUi
+})
+$ui.modePick.Add_SelectionChanged({ Update-ModeUi })
+$limit.add_ValueChanged({ Update-ModeUi })
+On-Toggle $ui.extendedSpeed { Update-RateLimit }
+
+# ===== Click engine ========================================================
+$script:running = $false
+$script:stopwatch = [System.Diagnostics.Stopwatch]::new()
+$script:samples = [System.Collections.Queue]::new()
+$script:points = [System.Collections.ArrayList]::new()
+$script:processIds = [System.Collections.Generic.List[int]]::new()
+$script:selectedProcessTitle = ''
+$script:stopReason = $null
+$script:startedByHold = $false
+
+function Set-Message([string]$text, [string]$brushKey = 'Muted') {
+    $ui.messageLabel.Text = $text
+    $ui.messageLabel.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, $brushKey)
+}
+function Set-RunningUi([bool]$on) {
+    $start = [string]$ui.keyPick.SelectedItem
+    if ($on) {
+        $ui.statusText.Text = 'ACTIVE'
+        $ui.statusText.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, 'Warn')
+        $ui.statusDot.SetResourceReference([System.Windows.Shapes.Shape]::FillProperty, 'Warn')
+        $ui.startText.Text = "Clicking$($script:ell)  ($start to stop)"
+        $ui.startGlyph.Text = [string][char]0xE769
+        $ui.quickText.Text = "Clicking$($script:ell)"; $ui.quickGlyph.Text = [string][char]0xE769
+        $window.Title = 'TapForge - clicking'
+    } else {
+        $ui.statusText.Text = 'READY'
+        $ui.statusText.SetResourceReference([System.Windows.Controls.TextBlock]::ForegroundProperty, 'Good')
+        $ui.statusDot.SetResourceReference([System.Windows.Shapes.Shape]::FillProperty, 'Good')
+        $ui.startText.Text = 'Start clicking'; $ui.startGlyph.Text = [string][char]0xE768
+        $ui.quickText.Text = 'Start'; $ui.quickGlyph.Text = [string][char]0xE768
+        $window.Title = 'TapForge'
+    }
+    if ($script:trayIcon) { $script:trayIcon.Text = if ($on) { 'TapForge - clicking' } else { 'TapForge' } }
+    Update-ActiveOverlay
+}
+function Update-Readout {
+    $count = [ClickNative]::Count
+    $ui.countLabel.Text = $count.ToString('N0')
+    $ui.elapsedLabel.Text = $script:stopwatch.Elapsed.ToString('hh\:mm\:ss')
+    $ui.quickCount.Text = $count.ToString('N0') + ' clicks'
+}
+
 function Start-Clicking {
     if ($script:running) { return }
-    if($script:pointsEnabled.Checked -and $script:points.Count -eq 0){[System.Windows.Forms.MessageBox]::Show('Pick at least one screen location on the Click Points page, or turn click points off.','TapForge');return}
-    if($script:filterProcess.Checked){if($processList.SelectedIndex -lt 0 -or $processList.SelectedIndex -ge $script:processIds.Count){[System.Windows.Forms.MessageBox]::Show('Select an application on the Process List page first.','TapForge');return};[ClickNative]::TargetProcessId=$script:processIds[$processList.SelectedIndex]}else{[ClickNative]::TargetProcessId=0}
-    $script:running=$true; $script:clickCount=0; $script:stopwatch.Restart();$script:stopReason=$null
-    $startButton.Text='●   Clicking…';$quickStart.Text='●  Clicking…'; $startButton.BackColor=[System.Drawing.Color]::FromArgb(82,66,174); $statusPill.Text='●  ACTIVE'; $statusPill.ForeColor=[System.Drawing.Color]::FromArgb(255,196,95);Update-TaskbarIcon
-    $modeLabel.Text=@('Continuous','Click count limit','Time limit')[$modePick.SelectedIndex]
-    # Store settings in script scope because the timer event runs after this
-    # function returns and cannot reliably see its local variables.
-    $script:buttonFlags=@(0x0002,0x0008,0x0020); $script:upFlags=@(0x0004,0x0010,0x0040); $script:which=$buttonPick.SelectedIndex
-    $every=[int](Get-IntervalMilliseconds); $script:target=[long]$limit.Value; $script:mode=$modePick.SelectedIndex
-    $maxClicks=if($script:mode -eq 1){[int]$script:target}else{0}; $maxSeconds=if($script:mode -eq 2){[int]$script:target}else{0}
-    if($script:pointsEnabled.Checked -and $script:stopWhenPointsDone.Checked -and $script:points.Count -gt 0){$maxClicks=$script:points.Count*[int]$script:pointDefaultClicks.Value;$maxSeconds=0}
-    $vk=@{Space=0x20;Enter=0x0D;A=0x41;F=0x46}[$keyCodePick.SelectedItem.ToString()]
-    $pointFlat=[System.Collections.Generic.List[int]]::new(); if($script:pointsEnabled.Checked){foreach($p in $script:points){$pointFlat.Add([int]$p.X);$pointFlat.Add([int]$p.Y)}}
-    $script:buttonFlags=@(0x0002,0x0008,0x0020); $script:upFlags=@(0x0004,0x0010,0x0040); $script:which=$buttonPick.SelectedIndex
-    $perPoint=if($script:pointsEnabled.Checked){[int]$script:pointDefaultClicks.Value}else{1}
-    [ClickNative]::Configure([int]$randomize.Value,[int]$duty.Value,$maxClicks,$maxSeconds,$cornerStop.Checked,[int]$cornerSize.Value,$edgeStop.Checked,[int]$edgeSize.Value,$keyboardMode.Checked,$vk,$doubleClick.Checked,$pointFlat.ToArray(),[int]$script:pointDefaultRadius.Value,$perPoint)
-    [ClickNative]::Start([uint32]$script:buttonFlags[$script:which],[uint32]$script:upFlags[$script:which],$every)
-    $script:clickTimer=[System.Windows.Forms.Timer]::new(); $script:clickTimer.Interval=50
-    $script:clickTimer.Add_Tick({
-        $script:clickCount=[ClickNative]::Count
-        if (![ClickNative]::Active) { $script:stopReason='A click limit or screen safety stop was reached.'; Stop-Clicking }
-        if (!$form.IsDisposed) { $countLabel.Text=$script:clickCount.ToString('N0'); $elapsedLabel.Text=$script:stopwatch.Elapsed.ToString('hh\:mm\:ss') }
-    })
-    $script:clickTimer.Start()
-}
-$startButton.Add_Click({ if($script:running){Stop-Clicking}else{Start-Clicking} })
-$stopButton.Add_Click({ Stop-Clicking })
-$script:trayIcon=[System.Windows.Forms.NotifyIcon]::new();$script:trayIcon.Icon=$script:logoIcon;$script:trayIcon.Text='TapForge';$trayMenu=[System.Windows.Forms.ContextMenuStrip]::new();$trayShow=$trayMenu.Items.Add('Open TapForge');$trayExit=$trayMenu.Items.Add('Exit');$script:trayIcon.ContextMenuStrip=$trayMenu
-$script:RestoreFromTray={if($form.Visible -eq $false){$form.Show()};$form.WindowState='Normal';$form.Activate();$script:trayIcon.Visible=$false}
-$trayShow.Add_Click({& $script:RestoreFromTray});$trayExit.Add_Click({$script:exitRequested=$true;$script:trayIcon.Visible=$false;$form.Close()});$script:trayIcon.Add_DoubleClick({& $script:RestoreFromTray})
-$form.Add_Resize({if($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized -and $script:minimizeTray.Checked){$form.Hide();$script:trayIcon.Visible=$true};if($script:windowMax){$script:windowMax.Text=if($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Maximized){'❐'}else{'□'};$script:headerTips.SetToolTip($script:windowMax, $(if($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Maximized){'Restore'}else{'Maximize'}))};if($script:currentPage -and !$script:compactMode -and $form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized){Show-Page $script:currentPage}})
-$form.Add_FormClosing({param($s,$e)if($script:rememberPosition.Checked){try{@{x=$form.Location.X;y=$form.Location.Y}|ConvertTo-Json|Set-Content -LiteralPath $script:windowStateFile -Encoding UTF8}catch{}};Save-UserSettings;if($script:minimizeTray.Checked -and !$script:exitRequested -and $e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing){$e.Cancel=$true;$form.Hide();$script:trayIcon.Visible=$true}else{if($script:clickTimer){$script:clickTimer.Stop();$script:clickTimer.Dispose();$script:clickTimer=$null};[ClickNative]::Stop();$script:running=$false;$script:trayIcon.Visible=$false;$script:trayIcon.Dispose()}})
+    if ((Is-On $ui.pointsEnabled) -and $script:points.Count -eq 0) {
+        Show-Page 'Points'
+        [void](Show-TFDialog 'No click points' 'Pick at least one screen location on the Click points page, or turn click points off.')
+        return
+    }
+    if (Is-On $ui.filterProcess) {
+        $idx = $ui.processList.SelectedIndex
+        if ($idx -lt 0 -or $idx -ge $script:processIds.Count) {
+            Show-Page 'Process'
+            [void](Show-TFDialog 'Choose an app' 'Select the app TapForge should click in, or turn off "Only click in the selected app".')
+            return
+        }
+        [ClickNative]::TargetProcessId = $script:processIds[$idx]
+    } else { [ClickNative]::TargetProcessId = 0 }
 
-$hotkeyTimer=[System.Windows.Forms.Timer]::new(); $hotkeyTimer.Interval=35
-$script:BeginScreenPick={
-    $bounds=[System.Windows.Forms.SystemInformation]::VirtualScreen
-    $script:pickerOverlay=[System.Windows.Forms.Form]::new();$script:pickerOverlay.FormBorderStyle='None';$script:pickerOverlay.StartPosition='Manual';$script:pickerOverlay.Bounds=$bounds;$script:pickerOverlay.TopMost=$true;$script:pickerOverlay.Opacity=0.14;$script:pickerOverlay.BackColor=[System.Drawing.Color]::Black;$script:pickerOverlay.Cursor=[System.Windows.Forms.Cursors]::Cross;$script:pickerOverlay.ShowInTaskbar=$false;$script:pickerOverlay.KeyPreview=$true
-    $script:pointPicker=$true;$script:lastLeft=$false
-    [void]$script:pickerOverlay.ShowDialog($form)
-    if(!$script:pickerOverlay.IsDisposed){$script:pickerOverlay.Dispose()};$script:pickerOverlay=$null;$script:pointPicker=$false
-    $pickPoint.Text='Pick point';$pickPoint.BackColor=$script:colorAccent
+    $mode = $ui.modePick.SelectedIndex
+    $maxClicks = if ($mode -eq 1) { [int]$limit.Value } else { 0 }
+    $maxSeconds = if ($mode -eq 2) { [int]$limit.Value } else { 0 }
+    $perPoint = if (Is-On $ui.pointsEnabled) { [int]$pointClicks.Value } else { 1 }
+    if ((Is-On $ui.pointsEnabled) -and (Is-On $ui.stopWhenPointsDone) -and $script:points.Count -gt 0) {
+        $maxClicks = $script:points.Count * $perPoint; $maxSeconds = 0
+    }
+    $vk = [int]$script:sendKeys[[string]$ui.keyCodePick.SelectedItem]
+    $flat = [System.Collections.Generic.List[int]]::new()
+    if (Is-On $ui.pointsEnabled) { foreach ($p in $script:points) { $flat.Add([int]$p.X); $flat.Add([int]$p.Y) } }
+    $downFlags = @(0x0002, 0x0008, 0x0020); $upFlags = @(0x0004, 0x0010, 0x0040)
+    $which = [Math]::Max(0, $ui.buttonPick.SelectedIndex)
+
+    [ClickNative]::Configure([int]$randomize.Value, [int]$duty.Value, $maxClicks, $maxSeconds,
+        (Is-On $ui.cornerStop), [int]$cornerSize.Value, (Is-On $ui.edgeStop), [int]$edgeSize.Value,
+        (Is-On $ui.keyboardMode), $vk, ($ui.clickTypePick.SelectedIndex -eq 1), $flat.ToArray(),
+        [int]$pointRadius.Value, $perPoint)
+    [ClickNative]::Start([uint32]$downFlags[$which], [uint32]$upFlags[$which], [double](Get-ClickPeriodMs))
+
+    $script:running = $true
+    $script:stopReason = $null
+    $script:stopwatch.Restart()
+    $script:samples.Clear()
+    $ui.rateLabel.Text = '0.0 cps'
+    $ui.modeLabel.Text = Get-ModeText
+    $where = if ((Is-On $ui.pointsEnabled)) { "on $($script:points.Count) click point(s)" } elseif (Is-On $ui.keyboardMode) { "pressing $([string]$ui.keyCodePick.SelectedItem)" } else { 'at your cursor' }
+    Set-Message "Clicking $where." 'Accent'
+    Set-RunningUi $true
+    $script:monitorTimer.Start()
 }
-$pickPoint.Add_Click({$pickPoint.Text='Click a screen location · Esc cancels';$pickPoint.BackColor=[System.Drawing.Color]::FromArgb(82,66,174);& $script:BeginScreenPick})
-$removePoint.Add_Click({if($pointList.SelectedIndex -ge 0){$i=$pointList.SelectedIndex;$script:points.RemoveAt($i);$pointList.Items.RemoveAt($i)}})
-$hotkeyTimer.Add_Tick({
-    $f6code=@{ 'F6'=0x75; 'F8'=0x77; 'F9'=0x78; 'F10'=0x79; 'F11'=0x7A; 'F12'=0x7B }[$keyPick.SelectedItem.ToString()]
-    $f6=(([ClickNative]::GetAsyncKeyState($f6code) -band 0x8000) -ne 0)
-    $emergencyCode=@{'F7'=0x76;'F8'=0x77;'F9'=0x78;'F10'=0x79;'F11'=0x7A;'F12'=0x7B}[$script:emergencyKey.SelectedItem.ToString()]
-    $f7=(([ClickNative]::GetAsyncKeyState($emergencyCode) -band 0x8000) -ne 0)
-    $mods=$false;foreach($vk in @(0x10,0x11,0x12,0x5B,0x5C)){if(([ClickNative]::GetAsyncKeyState($vk) -band 0x8000) -ne 0){$mods=$true}}
-    $startAllowed=(!$script:strictHotkey.Checked -or !$mods)
-    if($script:stopAltTab.Checked -and $script:running -and $mods -and (([ClickNative]::GetAsyncKeyState(0x09) -band 0x8000) -ne 0)){ $script:stopReason='Stopped after switching windows.';Stop-Clicking }
-    if($hotkeyMode.SelectedIndex -eq 0){if($f6 -and !$script:lastF6 -and $startAllowed){ if($script:running){Stop-Clicking}else{Start-Clicking} }}
-    else {if($f6 -and !$script:running -and $startAllowed){Start-Clicking};if(!$f6 -and $script:running){Stop-Clicking}}
-    if($f7 -and !$script:lastF7 -and $script:running){Stop-Clicking}
-    $left=(([ClickNative]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0)
-    if($script:pointPicker -and (([ClickNative]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)){if($script:pickerOverlay -and !$script:pickerOverlay.IsDisposed){$script:pickerOverlay.Close()}}
-    if($script:pointPicker -and $left -and !$script:lastLeft){$pt=[ClickNative]::Cursor;[void]$script:points.Add([System.Drawing.Point]::new($pt[0],$pt[1]));[void]$pointList.Items.Add("Point $($script:points.Count): $($pt[0]), $($pt[1])");if($script:pickerOverlay -and !$script:pickerOverlay.IsDisposed){$script:pickerOverlay.Close()}}
-    $script:lastLeft=$left
-    $script:lastF6=$f6; $script:lastF7=$f7
+
+function Stop-Clicking([string]$reason) {
+    [ClickNative]::Stop()
+    if (-not $script:running) { return }
+    $script:running = $false
+    $script:startedByHold = $false
+    $script:stopwatch.Stop()
+    $script:monitorTimer.Stop()
+    Update-Readout
+    $count = [long][ClickNative]::Count
+    Add-UsageSession $count $script:stopwatch.Elapsed.TotalSeconds
+    Set-RunningUi $false
+    if ($reason) {
+        Set-Message ("$reason  {0:N0} clicks sent." -f $count) 'Muted'
+        if ((Is-On $ui.stopAlert) -and $script:trayIcon) {
+            $script:trayIcon.BalloonTipTitle = 'TapForge stopped'
+            $script:trayIcon.BalloonTipText = $reason
+            $wasVisible = $script:trayIcon.Visible
+            $script:trayIcon.Visible = $true
+            $script:trayIcon.ShowBalloonTip(2500)
+            if (-not $wasVisible -and $window.IsVisible) { $script:hideTrayAfterTip = $true }
+        }
+    } else {
+        Set-Message ('Stopped. {0:N0} clicks sent.' -f $count) 'Muted'
+    }
+    $ui.modeLabel.Text = Get-ModeText
+}
+function Switch-Clicking { if ($script:running) { Stop-Clicking } else { Start-Clicking } }
+
+$script:monitorTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:monitorTimer.Interval = [TimeSpan]::FromMilliseconds(50)
+$script:monitorTimer.Add_Tick({
+    if (-not $script:running) { return }
+    Update-Readout
+    $count = [ClickNative]::Count; $e = $script:stopwatch.Elapsed.TotalSeconds
+    $script:samples.Enqueue(@($e, $count))
+    while ($script:samples.Count -gt 1 -and ($e - $script:samples.Peek()[0]) -gt 1.0) { [void]$script:samples.Dequeue() }
+    $first = $script:samples.Peek(); $dt = $e - $first[0]
+    if ($dt -gt 0.2) { $ui.rateLabel.Text = '{0:N1} cps' -f (($count - $first[1]) / $dt) }
+    if (-not [ClickNative]::Active) {
+        $mode = $ui.modePick.SelectedIndex
+        $reason = if ((Is-On $ui.pointsEnabled) -and (Is-On $ui.stopWhenPointsDone)) { 'All click points done.' }
+                  elseif ($mode -eq 1) { 'Click limit reached.' }
+                  elseif ($mode -eq 2) { 'Time limit reached.' }
+                  else { 'Safety stop: the cursor reached a screen corner or edge.' }
+        Stop-Clicking $reason
+    }
 })
-$hotkeyTimer.Start()
-$global:TapForgeReady=$true
-& $script:checkForTapForgeUpdate $true
-[void]$form.ShowDialog()
-$hotkeyTimer.Stop(); $hotkeyTimer.Dispose()
-$script:brandImage.Dispose();$script:logoSourceImage.Dispose();$script:logoIcon.Dispose()
-$null
+
+$ui.startButton.Add_Click({ Switch-Clicking })
+$ui.stopButton.Add_Click({ Stop-Clicking })
+$ui.quickStart.Add_Click({ Switch-Clicking })
+$ui.quickStop.Add_Click({ Stop-Clicking })
+
+# ===== Global hotkeys ======================================================
+$script:lastStart = $false; $script:lastEmergency = $false
+function Test-KeyDown([int]$vk) { ([ClickNative]::GetAsyncKeyState($vk) -band 0x8000) -ne 0 }
+$script:hotkeyTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:hotkeyTimer.Interval = [TimeSpan]::FromMilliseconds(15)
+$script:hotkeyTimer.Add_Tick({
+    if ($script:pickingPoint) { return }
+    $startDown = Test-KeyDown ([int]$script:keyMap[[string]$ui.keyPick.SelectedItem])
+    $emergencyDown = Test-KeyDown ([int]$script:keyMap[[string]$ui.emergencyKey.SelectedItem])
+    $mods = $false
+    foreach ($m in @(0x10, 0x11, 0x12, 0x5B, 0x5C)) { if (Test-KeyDown $m) { $mods = $true } }
+    $allowed = (-not (Is-On $ui.strictHotkey)) -or (-not $mods)
+    if ((Is-On $ui.stopAltTab) -and $script:running -and (Test-KeyDown 0x12) -and (Test-KeyDown 0x09)) { Stop-Clicking 'Stopped after switching windows.' }
+    if ($ui.hotkeyMode.SelectedIndex -eq 0) {
+        if ($startDown -and -not $script:lastStart -and $allowed) { Switch-Clicking }
+    } else {
+        if ($startDown -and -not $script:running -and $allowed) { Start-Clicking; if ($script:running) { $script:startedByHold = $true } }
+        if (-not $startDown -and $script:running -and $script:startedByHold) { Stop-Clicking }
+    }
+    if ($emergencyDown -and -not $script:lastEmergency -and $script:running) { Stop-Clicking 'Emergency stop.' }
+    $script:lastStart = $startDown; $script:lastEmergency = $emergencyDown
+})
+
+function Update-HotkeyCaption {
+    $s = [string]$ui.keyPick.SelectedItem; $e = [string]$ui.emergencyKey.SelectedItem
+    $text = "$s start / stop   $($script:mid)   $e emergency stop"
+    $ui.hotkeyCaption.Text = $text; $ui.quickHotkey.Text = $text
+}
+$script:prevStartKey = 'F6'; $script:prevEmergencyKey = 'F7'
+function Confirm-Keys([string]$changed) {
+    $s = [string]$ui.keyPick.SelectedItem; $e = [string]$ui.emergencyKey.SelectedItem
+    if ($s -and $s -eq $e) {
+        if ($changed -eq 'start') { $ui.keyPick.SelectedItem = $script:prevStartKey } else { $ui.emergencyKey.SelectedItem = $script:prevEmergencyKey }
+        $ui.keyWarning.Text = "$s is already used for the other shortcut. Pick a different key."
+        $ui.keyWarning.Visibility = 'Visible'
+        return
+    }
+    $ui.keyWarning.Visibility = 'Collapsed'
+    $script:prevStartKey = $s; $script:prevEmergencyKey = $e
+    Update-HotkeyCaption
+}
+$ui.keyPick.Add_SelectionChanged({ Confirm-Keys 'start' })
+$ui.emergencyKey.Add_SelectionChanged({ Confirm-Keys 'emergency' })
+$ui.editKeysButton.Add_Click({ Show-Page 'Keybinds' })
+
+# ===== Navigation ==========================================================
+$script:pageMap = [ordered]@{ Clicking = 'pageClicking'; More = 'pageMore'; Points = 'pagePoints'; General = 'pageGeneral'; Behavior = 'pageBehavior'; Appearance = 'pageAppearance'; Keybinds = 'pageKeybinds'; Process = 'pageProcess'; Presets = 'pagePresets'; Maintenance = 'pageMaintenance' }
+$script:sideMap = @{ General = 'sideGeneral'; Behavior = 'sideBehavior'; Appearance = 'sideAppearance'; Keybinds = 'sideKeybinds'; Process = 'sideProcess'; Presets = 'sidePresets'; Maintenance = 'sideMaintenance' }
+$script:navigating = $false
+
+function Set-NavActive([string]$name, [bool]$on) {
+    $b = $ui[$name]
+    if ($on) {
+        $b.SetResourceReference([System.Windows.Controls.Control]::ForegroundProperty, 'Accent')
+        $b.SetResourceReference([System.Windows.Controls.Control]::BackgroundProperty, 'AccentSoft')
+    } else {
+        $b.ClearValue([System.Windows.Controls.Control]::ForegroundProperty)
+        $b.ClearValue([System.Windows.Controls.Control]::BackgroundProperty)
+    }
+}
+function Show-Page([string]$name) {
+    if ($script:navigating) { return }
+    if (-not $script:pageMap.Contains($name)) { $name = 'Clicking' }
+    if ($script:compactMode) { Set-Compact $false }
+    $script:navigating = $true
+    try {
+        $script:currentPage = $name
+        foreach ($k in $script:pageMap.Keys) { $ui[$script:pageMap[$k]].Visibility = if ($k -eq $name) { 'Visible' } else { 'Collapsed' } }
+        $isSettings = $script:sideMap.ContainsKey($name)
+        $ui.sidebar.Visibility = if ($isSettings) { 'Visible' } else { 'Collapsed' }
+        if ($isSettings) { $script:lastSettingsPage = $name; $ui[$script:sideMap[$name]].IsChecked = $true }
+        Set-NavActive 'navSettings' $isSettings
+        Set-NavActive 'navClicking' ($name -eq 'Clicking')
+        Set-NavActive 'navMore' ($name -eq 'More')
+        Set-NavActive 'navPoints' ($name -eq 'Points')
+    } finally { $script:navigating = $false }
+    Apply-Accent
+    if ($name -eq 'Process' -and $ui.processList.Items.Count -eq 0) { Update-ProcessList }
+    if ($name -eq 'General') { Update-UsageUi }
+}
+$ui.navSettings.Add_Click({ Show-Page $script:lastSettingsPage })
+$ui.navClicking.Add_Click({ Show-Page 'Clicking' })
+$ui.navMore.Add_Click({ Show-Page 'More' })
+$ui.navPoints.Add_Click({ Show-Page 'Points' })
+$ui.sideGeneral.Add_Checked({ Show-Page 'General' })
+$ui.sideBehavior.Add_Checked({ Show-Page 'Behavior' })
+$ui.sideAppearance.Add_Checked({ Show-Page 'Appearance' })
+$ui.sideKeybinds.Add_Checked({ Show-Page 'Keybinds' })
+$ui.sideProcess.Add_Checked({ Show-Page 'Process' })
+$ui.sidePresets.Add_Checked({ Show-Page 'Presets' })
+$ui.sideMaintenance.Add_Checked({ Show-Page 'Maintenance' })
+$ui.sideGithub.Add_Click({ Start-Process $script:repoUrl })
+$ui.githubButton.Add_Click({ Start-Process $script:repoUrl })
+$ui.changesButton.Add_Click({ Start-Process ($script:repoUrl + '/releases') })
+
+# ===== Window chrome =======================================================
+$script:compactMode = $false
+$script:normalSize = @(940, 680)
+function Update-MaxGlyph {
+    $max = ($window.WindowState -eq [System.Windows.WindowState]::Maximized)
+    $ui.maxButton.Content = if ($max) { [string][char]0xE923 } else { [string][char]0xE922 }
+    $ui.maxButton.ToolTip = if ($max) { 'Restore' } else { 'Maximize' }
+    $ui.root.Margin = if ($max) { [System.Windows.Thickness]::new(7) } else { [System.Windows.Thickness]::new(0) }
+}
+function Set-Compact([bool]$on) {
+    if ($on -eq $script:compactMode) { return }
+    $script:compactMode = $on
+    if ($on) {
+        if ($window.WindowState -eq [System.Windows.WindowState]::Maximized) { $window.WindowState = [System.Windows.WindowState]::Normal }
+        $script:normalSize = @($window.Width, $window.Height)
+        $ui.sidebar.Visibility = 'Collapsed'; $ui.contentFrame.Visibility = 'Collapsed'; $ui.compactPanel.Visibility = 'Visible'
+        $window.MinWidth = 520; $window.MinHeight = 140
+        $window.Width = 600
+        $window.Height = if (Is-On $ui.footerToggle) { 178 } else { 150 }
+        $ui.compactButton.Content = [string][char]0xE740; $ui.compactButton.ToolTip = 'Full window'
+        $ui.brandTitle.Visibility = 'Collapsed'
+    } else {
+        $ui.compactPanel.Visibility = 'Collapsed'; $ui.contentFrame.Visibility = 'Visible'
+        $window.MinWidth = 800; $window.MinHeight = 580
+        $window.Width = [Math]::Max(800, $script:normalSize[0]); $window.Height = [Math]::Max(580, $script:normalSize[1])
+        $ui.compactButton.Content = [string][char]0xE73F; $ui.compactButton.ToolTip = 'Compact mode'
+        $ui.brandTitle.Visibility = 'Visible'
+        Show-Page $script:currentPage
+    }
+}
+$ui.compactButton.Add_Click({ Set-Compact (-not $script:compactMode) })
+$ui.minButton.Add_Click({ $window.WindowState = [System.Windows.WindowState]::Minimized })
+$ui.maxButton.Add_Click({
+    $window.WindowState = if ($window.WindowState -eq [System.Windows.WindowState]::Maximized) { [System.Windows.WindowState]::Normal } else { [System.Windows.WindowState]::Maximized }
+})
+$ui.closeButton.Add_Click({ $window.Close() })
+$ui.pinButton.Add_Click({ $ui.alwaysTop.IsChecked = -not (Is-On $ui.alwaysTop) })
+On-Toggle $ui.alwaysTop {
+    $on = Is-On $ui.alwaysTop
+    $window.Topmost = $on
+    $ui.pinButton.Content = if ($on) { [string][char]0xE840 } else { [string][char]0xE718 }
+    Set-NavActive 'pinButton' $on
+}
+On-Toggle $ui.footerToggle { $ui.footer.Visibility = if (Is-On $ui.footerToggle) { 'Visible' } else { 'Collapsed' } }
+$window.Add_SourceInitialized({
+    $script:hwnd = [System.Windows.Interop.WindowInteropHelper]::new($window).Handle
+    [TapForgeShell]::StyleWindow($script:hwnd, -not $script:lightTheme)
+})
+$window.Add_StateChanged({
+    Update-MaxGlyph
+    if ($window.WindowState -eq [System.Windows.WindowState]::Minimized -and (Is-On $ui.minimizeTray)) {
+        $window.Hide(); $script:trayIcon.Visible = $true
+    }
+})
+
+# ===== Dialogs =============================================================
+function Show-TFDialog([string]$title, [string]$message, [string[]]$buttons = @('OK'), [int]$primary = -1, [switch]$WithInput, [string]$default = '') {
+    $d = [System.Windows.Markup.XamlReader]::Parse($dialogXaml)
+    $d.FindName('dlgTitle').Text = $title
+    $d.FindName('dlgMessage').Text = $message
+    $script:dlgInput = $d.FindName('dlgInput')
+    if ($WithInput) { $script:dlgInput.Visibility = 'Visible'; $script:dlgInput.Text = $default }
+    if ($primary -lt 0) { $primary = $buttons.Count - 1 }
+    $panel = $d.FindName('dlgButtons')
+    $script:dlgResult = -1; $script:dlgText = $null
+    for ($i = 0; $i -lt $buttons.Count; $i++) {
+        $b = [System.Windows.Controls.Button]::new()
+        $b.Content = $buttons[$i]; $b.MinWidth = 96; $b.Tag = $i
+        $b.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+        if ($i -eq $primary) { $b.Style = $script:app.Resources['AccentButton']; $b.IsDefault = $true }
+        if ($buttons[$i] -in @('Cancel', 'No', 'Not now')) { $b.IsCancel = $true }
+        $b.Add_Click({
+            param($s, $e)
+            $script:dlgResult = [int]$s.Tag
+            $script:dlgText = $script:dlgInput.Text
+            [System.Windows.Window]::GetWindow($s).Close()
+        })
+        [void]$panel.Children.Add($b)
+    }
+    if ($window.IsVisible) { $d.Owner = $window } else { $d.WindowStartupLocation = [System.Windows.WindowStartupLocation]::CenterScreen; $d.Topmost = $true }
+    $d.Add_ContentRendered({ if ($script:dlgInput.Visibility -eq 'Visible') { [void]$script:dlgInput.Focus(); $script:dlgInput.SelectAll() } })
+    [void]$d.ShowDialog()
+    $script:dlgResult
+}
+
+function Convert-HsvToColor([double]$h, [double]$s, [double]$v) {
+    $h = (($h % 360) + 360) % 360
+    $c = $v * $s; $x = $c * (1 - [Math]::Abs((($h / 60) % 2) - 1)); $m = $v - $c
+    if ($h -lt 60) { $r = $c; $g = $x; $b = 0 } elseif ($h -lt 120) { $r = $x; $g = $c; $b = 0 } elseif ($h -lt 180) { $r = 0; $g = $c; $b = $x }
+    elseif ($h -lt 240) { $r = 0; $g = $x; $b = $c } elseif ($h -lt 300) { $r = $x; $g = 0; $b = $c } else { $r = $c; $g = 0; $b = $x }
+    [System.Windows.Media.Color]::FromRgb([byte][Math]::Round(($r + $m) * 255), [byte][Math]::Round(($g + $m) * 255), [byte][Math]::Round(($b + $m) * 255))
+}
+function Convert-ColorToHsv([System.Windows.Media.Color]$c) {
+    $r = $c.R / 255.0; $g = $c.G / 255.0; $b = $c.B / 255.0
+    $max = [Math]::Max($r, [Math]::Max($g, $b)); $min = [Math]::Min($r, [Math]::Min($g, $b)); $delta = $max - $min
+    $h = 0.0
+    if ($delta -gt 0) {
+        if ($max -eq $r) { $h = 60 * ((($g - $b) / $delta) % 6) } elseif ($max -eq $g) { $h = 60 * ((($b - $r) / $delta) + 2) } else { $h = 60 * ((($r - $g) / $delta) + 4) }
+    }
+    if ($h -lt 0) { $h += 360 }
+    $s = if ($max -eq 0) { 0.0 } else { $delta / $max }
+    @($h, $s, $max)
+}
+function Show-ColorPicker([string]$initialHex) {
+    $d = [System.Windows.Markup.XamlReader]::Parse($colorXaml)
+    $script:cp = @{}
+    foreach ($n in @('cpPreview', 'cpHex', 'cpHue', 'cpSat', 'cpVal', 'cpSwatches', 'cpCancel', 'cpApply')) { $script:cp[$n] = $d.FindName($n) }
+    $script:cpResult = $null; $script:cpBusy = $false
+    $script:cpSetFromHex = {
+        param([string]$hex)
+        $hsv = Convert-ColorToHsv (ConvertTo-MediaColor $hex)
+        $script:cpBusy = $true
+        $script:cp.cpHue.Value = $hsv[0]; $script:cp.cpSat.Value = $hsv[1] * 100; $script:cp.cpVal.Value = $hsv[2] * 100
+        $script:cpBusy = $false
+        & $script:cpRefresh $true
+    }
+    $script:cpRefresh = {
+        param([bool]$updateHex)
+        $c = Convert-HsvToColor $script:cp.cpHue.Value ($script:cp.cpSat.Value / 100) ($script:cp.cpVal.Value / 100)
+        $script:cp.cpPreview.Background = [System.Windows.Media.SolidColorBrush]::new($c)
+        $pure = Convert-HsvToColor $script:cp.cpHue.Value 1 1
+        $script:cp.cpSat.Background = [System.Windows.Media.LinearGradientBrush]::new([System.Windows.Media.Colors]::White, (Convert-HsvToColor $script:cp.cpHue.Value 1 ($script:cp.cpVal.Value / 100)), 0)
+        $script:cp.cpVal.Background = [System.Windows.Media.LinearGradientBrush]::new([System.Windows.Media.Colors]::Black, (Convert-HsvToColor $script:cp.cpHue.Value ($script:cp.cpSat.Value / 100) 1), 0)
+        if ($updateHex) { $script:cpBusy = $true; $script:cp.cpHex.Text = ConvertTo-Hex $c; $script:cpBusy = $false }
+    }
+    foreach ($n in @('cpHue', 'cpSat', 'cpVal')) { $script:cp[$n].Add_ValueChanged({ if (-not $script:cpBusy) { & $script:cpRefresh $true } }) }
+    $script:cp.cpHex.Add_TextChanged({
+        if ($script:cpBusy) { return }
+        $t = $script:cp.cpHex.Text.Trim(); if ($t -notmatch '^#') { $t = '#' + $t }
+        if (Test-Hex $t) {
+            $hsv = Convert-ColorToHsv (ConvertTo-MediaColor $t)
+            $script:cpBusy = $true
+            $script:cp.cpHue.Value = $hsv[0]; $script:cp.cpSat.Value = $hsv[1] * 100; $script:cp.cpVal.Value = $hsv[2] * 100
+            $script:cpBusy = $false
+            & $script:cpRefresh $false
+        }
+    })
+    foreach ($hex in $script:swatches) {
+        $sw = [System.Windows.Controls.Border]::new()
+        $sw.Width = 24; $sw.Height = 24; $sw.CornerRadius = [System.Windows.CornerRadius]::new(12)
+        $sw.Margin = [System.Windows.Thickness]::new(0, 0, 7, 7); $sw.Background = New-Brush $hex
+        $sw.Cursor = [System.Windows.Input.Cursors]::Hand; $sw.Tag = $hex
+        $sw.Add_MouseLeftButtonUp({ param($s, $e) & $script:cpSetFromHex ([string]$s.Tag) })
+        [void]$script:cp.cpSwatches.Children.Add($sw)
+    }
+    $script:cp.cpApply.Add_Click({
+        param($s, $e)
+        $script:cpResult = ConvertTo-Hex (Convert-HsvToColor $script:cp.cpHue.Value ($script:cp.cpSat.Value / 100) ($script:cp.cpVal.Value / 100))
+        [System.Windows.Window]::GetWindow($s).Close()
+    })
+    $script:cp.cpCancel.IsCancel = $true
+    $d.Owner = $window
+    & $script:cpSetFromHex $initialHex
+    [void]$d.ShowDialog()
+    $script:cpResult
+}
+
+# ===== Appearance ==========================================================
+$ui.themePick.Add_SelectionChanged({ Apply-Theme })
+$ui.appearanceModePick.Add_SelectionChanged({ Apply-Accent -Force })
+$ui.accentTarget.Add_SelectionChanged({ Update-AccentUi })
+$ui.hueButton.Add_Click({ $picked = Show-ColorPicker (Get-EditedAccent); if ($picked) { Set-EditedAccent $picked } })
+$ui.iconTheme.Add_SelectionChanged({ Update-Icons })
+$ui.iconColor.Add_SelectionChanged({ Update-Icons })
+On-Toggle $ui.activeIcon { Update-ActiveOverlay }
+
+# ===== Click points ========================================================
+$script:pickingPoint = $false
+function Update-PointList {
+    $ui.pointList.Items.Clear()
+    $i = 0
+    foreach ($p in $script:points) { $i++; [void]$ui.pointList.Items.Add(("Point {0}    X {1},  Y {2}" -f $i, $p.X, $p.Y)) }
+    $ui.pointsSummary.Text = if ($script:points.Count -eq 0) { 'No points yet. Click "Pick point", then click anywhere on screen.' } else { "$($script:points.Count) point(s), clicked in order." }
+}
+$ui.pickPoint.Add_Click({
+    $script:pickingPoint = $true
+    $overlay = [System.Windows.Forms.Form]::new()
+    $overlay.FormBorderStyle = 'None'; $overlay.StartPosition = 'Manual'
+    $overlay.Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $overlay.TopMost = $true; $overlay.ShowInTaskbar = $false; $overlay.KeyPreview = $true
+    $overlay.BackColor = [System.Drawing.Color]::Black; $overlay.Opacity = 0.35
+    $overlay.Cursor = [System.Windows.Forms.Cursors]::Cross
+    $tip = [System.Windows.Forms.Label]::new()
+    $tip.Text = 'Click where TapForge should click   ' + $script:mid + '   Esc to cancel'
+    $tip.ForeColor = [System.Drawing.Color]::White; $tip.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 34)
+    $tip.Font = [System.Drawing.Font]::new('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+    $tip.AutoSize = $true; $tip.Padding = [System.Windows.Forms.Padding]::new(14, 8, 14, 8)
+    $primary = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $tip.Location = [System.Drawing.Point]::new($primary.X - $overlay.Bounds.X + 40, $primary.Y - $overlay.Bounds.Y + 40)
+    $overlay.Controls.Add($tip)
+    $overlay.Add_MouseDown({
+        param($s, $e)
+        $pos = [System.Windows.Forms.Cursor]::Position
+        [void]$script:points.Add([System.Drawing.Point]::new($pos.X, $pos.Y))
+        $s.Close()
+    })
+    $overlay.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $s.Close() } })
+    $window.Hide()
+    try { [void]$overlay.ShowDialog() } finally {
+        $overlay.Dispose()
+        $window.Show(); [void]$window.Activate()
+        $script:pickingPoint = $false
+        Update-PointList
+    }
+})
+$ui.removePoint.Add_Click({
+    $i = $ui.pointList.SelectedIndex
+    if ($i -ge 0 -and $i -lt $script:points.Count) { $script:points.RemoveAt($i); Update-PointList }
+})
+$ui.clearPoints.Add_Click({
+    if ($script:points.Count -eq 0) { return }
+    if ((Show-TFDialog 'Clear all points?' "Remove all $($script:points.Count) click points?" @('Cancel', 'Clear all')) -eq 1) { $script:points.Clear(); Update-PointList }
+})
+
+# ===== Process list ========================================================
+function Update-ProcessList {
+    $ui.processList.Items.Clear(); $script:processIds.Clear()
+    $keep = -1
+    $procs = [System.Diagnostics.Process]::GetProcesses() | Where-Object { $_.MainWindowTitle -and $_.Id -ne $PID } | Sort-Object MainWindowTitle
+    foreach ($p in $procs) {
+        [void]$ui.processList.Items.Add(('{0}   (PID {1})' -f $p.MainWindowTitle, $p.Id))
+        $script:processIds.Add($p.Id)
+        if ($script:selectedProcessTitle -and $p.MainWindowTitle -eq $script:selectedProcessTitle) { $keep = $script:processIds.Count - 1 }
+    }
+    if ($keep -ge 0) { $ui.processList.SelectedIndex = $keep }
+}
+$ui.refreshProcesses.Add_Click({ Update-ProcessList })
+$ui.processList.Add_SelectionChanged({
+    $item = [string]$ui.processList.SelectedItem
+    if ($item) {
+        $script:selectedProcessTitle = $item -replace '   \(PID \d+\)$', ''
+        $ui.processSelectedLabel.Text = 'Selected: ' + $script:selectedProcessTitle
+    }
+})
+
+# ===== Presets =============================================================
+$script:activePreset = $null
+function Update-Footer {
+    $ui.footerLeft.Text = if ($script:activePreset) { 'Preset: ' + $script:activePreset } else { 'No preset active' }
+}
+function Update-PresetList {
+    $ui.presetList.Items.Clear()
+    foreach ($f in (Get-ChildItem -LiteralPath $script:presetDirectory -Filter '*.json' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        [void]$ui.presetList.Items.Add([System.IO.Path]::GetFileNameWithoutExtension($f.Name))
+    }
+    $ui.presetSummary.Text = if ($ui.presetList.Items.Count -eq 0) { 'No presets yet.' } else { 'Double-click a preset to load it.' }
+}
+function Get-PresetData {
+    @{
+        intervalMs = (Get-IntervalMilliseconds); intervalMsExact = $script:intervalMs; interval = [double]$interval.Value; intervalUnit = $ui.intervalUnit.SelectedIndex
+        button = $ui.buttonPick.SelectedIndex; stopMode = $ui.modePick.SelectedIndex; limit = [long]$limit.Value
+        speedMode = $ui.speedMode.SelectedIndex; rate = [double]$rate.Value; extended = (Is-On $ui.extendedSpeed)
+        hotkey = [string]$ui.keyPick.SelectedItem; hotkeyMode = $ui.hotkeyMode.SelectedIndex
+        keyboard = (Is-On $ui.keyboardMode); keyCode = $ui.keyCodePick.SelectedIndex; double = ($ui.clickTypePick.SelectedIndex -eq 1)
+        duty = [int]$duty.Value; random = [int]$randomize.Value
+        corners = (Is-On $ui.cornerStop); cornerSize = [int]$cornerSize.Value; edges = (Is-On $ui.edgeStop); edgeSize = [int]$edgeSize.Value
+    }
+}
+function Has-Prop($obj, [string]$name) { $null -ne $obj -and $null -ne $obj.PSObject.Properties[$name] }
+function Set-IntervalFromData($d) {
+    if (Has-Prop $d 'intervalUnit') { Set-Index $ui.intervalUnit $d.intervalUnit }
+    if (Has-Prop $d 'intervalMsExact') { $script:intervalMs = [Math]::Max(1.0, [double]$d.intervalMsExact) }
+    elseif (Has-Prop $d 'intervalMs') { $script:intervalMs = [Math]::Max(1.0, [double]$d.intervalMs) }
+    elseif (Has-Prop $d 'interval') { $script:intervalMs = [Math]::Max(1.0, [double]$d.interval) }
+    Show-IntervalInUnit
+}
+function Apply-PresetData($d) {
+    if (Has-Prop $d 'extended') { $ui.extendedSpeed.IsChecked = [bool]$d.extended }
+    Update-RateLimit
+    Set-IntervalFromData $d
+    if (Has-Prop $d 'button') { Set-Index $ui.buttonPick $d.button }
+    if (Has-Prop $d 'stopMode') { Set-Index $ui.modePick $d.stopMode }
+    if (Has-Prop $d 'limit') { $limit.Value = [double]$d.limit }
+    if (Has-Prop $d 'speedMode') { Set-Index $ui.speedMode $d.speedMode }
+    if (Has-Prop $d 'rate') { $rate.Value = [double]$d.rate }
+    if ((Has-Prop $d 'hotkey') -and $ui.keyPick.Items.Contains([string]$d.hotkey) -and [string]$d.hotkey -ne [string]$ui.emergencyKey.SelectedItem) { $ui.keyPick.SelectedItem = [string]$d.hotkey }
+    if (Has-Prop $d 'hotkeyMode') { Set-Index $ui.hotkeyMode $d.hotkeyMode }
+    if (Has-Prop $d 'keyboard') { $ui.keyboardMode.IsChecked = [bool]$d.keyboard }
+    if (Has-Prop $d 'keyCode') { Set-Index $ui.keyCodePick $d.keyCode }
+    if (Has-Prop $d 'double') { $ui.clickTypePick.SelectedIndex = if ([bool]$d.double) { 1 } else { 0 } }
+    if (Has-Prop $d 'duty') { $duty.Value = [double]$d.duty }
+    if (Has-Prop $d 'random') { $randomize.Value = [double]$d.random }
+    if (Has-Prop $d 'corners') { $ui.cornerStop.IsChecked = [bool]$d.corners }
+    if (Has-Prop $d 'cornerSize') { $cornerSize.Value = [double]$d.cornerSize }
+    if (Has-Prop $d 'edges') { $ui.edgeStop.IsChecked = [bool]$d.edges }
+    if (Has-Prop $d 'edgeSize') { $edgeSize.Value = [double]$d.edgeSize }
+    Update-SpeedUi; Update-ModeUi
+}
+function Load-SelectedPreset {
+    $name = [string]$ui.presetList.SelectedItem
+    if (-not $name) { return }
+    try {
+        $d = Get-Content -LiteralPath (Join-Path $script:presetDirectory ($name + '.json')) -Raw | ConvertFrom-Json
+        Apply-PresetData $d
+        $script:activePreset = $name; Update-Footer
+        Set-Message "Loaded preset '$name'." 'Accent'
+    } catch { [void](Show-TFDialog 'Could not load preset' $_.Exception.Message) }
+}
+$ui.presetSave.Add_Click({
+    $name = ($ui.presetName.Text -replace '[^a-zA-Z0-9 _-]', '').Trim()
+    if (-not $name) { [void](Show-TFDialog 'Name your preset' 'Type a name for the preset first (letters, numbers, spaces, - and _).'); return }
+    $path = Join-Path $script:presetDirectory ($name + '.json')
+    if ((Test-Path -LiteralPath $path) -and (Show-TFDialog 'Replace preset?' "A preset named '$name' already exists. Replace it?" @('Cancel', 'Replace')) -ne 1) { return }
+    Get-PresetData | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding UTF8
+    $script:activePreset = $name; Update-Footer; Update-PresetList
+    $ui.presetList.SelectedItem = $name; $ui.presetName.Text = ''
+})
+$ui.presetLoad.Add_Click({ Load-SelectedPreset })
+$ui.presetList.Add_MouseDoubleClick({ Load-SelectedPreset })
+$ui.presetDelete.Add_Click({
+    $name = [string]$ui.presetList.SelectedItem
+    if (-not $name) { return }
+    if ((Show-TFDialog 'Delete preset?' "Delete the preset '$name'? This can't be undone." @('Cancel', 'Delete')) -ne 1) { return }
+    Remove-Item -LiteralPath (Join-Path $script:presetDirectory ($name + '.json')) -Force -ErrorAction SilentlyContinue
+    if ($script:activePreset -eq $name) { $script:activePreset = $null; Update-Footer }
+    Update-PresetList
+})
+
+# ===== Usage statistics ====================================================
+$script:usage = @{ clicks = 0L; sessions = 0; seconds = 0.0; last = '' }
+try {
+    if (Test-Path -LiteralPath $script:usageFile) {
+        $u = Get-Content -LiteralPath $script:usageFile -Raw | ConvertFrom-Json
+        $script:usage = @{ clicks = [long]$u.clicks; sessions = [int]$u.sessions; seconds = [double]$u.seconds; last = [string]$u.last }
+    }
+} catch { }
+function Save-Usage { try { $script:usage | ConvertTo-Json | Set-Content -LiteralPath $script:usageFile -Encoding UTF8 } catch { } }
+function Add-UsageSession([long]$clicks, [double]$seconds) {
+    if ($clicks -le 0) { return }
+    $script:usage.clicks += $clicks; $script:usage.sessions += 1; $script:usage.seconds += $seconds
+    $script:usage.last = (Get-Date).ToString('o')
+    Save-Usage
+}
+function Update-UsageUi {
+    $has = $script:usage.sessions -gt 0
+    $ui.usageEmpty.Visibility = if ($has) { 'Collapsed' } else { 'Visible' }
+    $ui.usageGrid.Visibility = if ($has) { 'Visible' } else { 'Collapsed' }
+    if (-not $has) { return }
+    $ui.usageClicks.Text = ([long]$script:usage.clicks).ToString('N0')
+    $ui.usageSessions.Text = ([int]$script:usage.sessions).ToString('N0')
+    $t = [TimeSpan]::FromSeconds([double]$script:usage.seconds)
+    $ui.usageTime.Text = if ($t.TotalHours -ge 1) { '{0}h {1}m' -f [int][Math]::Floor($t.TotalHours), $t.Minutes } elseif ($t.TotalMinutes -ge 1) { '{0}m {1}s' -f $t.Minutes, $t.Seconds } else { '{0}s' -f [int]$t.TotalSeconds }
+    $ui.usageLast.Text = try { ([datetime]$script:usage.last).ToString('MMM d, h:mm tt') } catch { '-' }
+}
+
+# ===== Behavior ============================================================
+$script:restoring = $false
+On-Toggle $ui.runOnStartup {
+    if ($script:restoring) { return }
+    try {
+        $rk = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run', $true)
+        if (Is-On $ui.runOnStartup) { $rk.SetValue('TapForge', '"' + $script:exePath + '"') } else { $rk.DeleteValue('TapForge', $false) }
+        $rk.Dispose()
+    } catch { [void](Show-TFDialog 'Startup setting' 'Could not update the Windows startup setting.') }
+}
+
+# ===== Maintenance + updates ===============================================
+$script:publisherPath = Join-Path $script:exeDir 'TapForge Publisher.ps1'
+$ui.publishUpdateButton.Visibility = if (Test-Path -LiteralPath $script:publisherPath) { 'Visible' } else { 'Collapsed' }
+function Set-UpdateStatus([string]$text) { $ui.updateStatus.Text = $text; $ui.maintUpdateStatus.Text = $text }
+Set-UpdateStatus "Current version: v$($script:appVersion)"
+$ui.openDiagnostics.Add_Click({ Start-Process explorer.exe -ArgumentList ('"' + $script:diagDir + '"') })
+$ui.exportDiagnostics.Add_Click({
+    $dlg = [Microsoft.Win32.SaveFileDialog]::new(); $dlg.Filter = 'JSON report|*.json'; $dlg.FileName = 'TapForge-diagnostics.json'
+    if ($dlg.ShowDialog($window)) {
+        $logTail = @(); try { $logTail = @(Get-Content -LiteralPath $script:logFile -Tail 50 -ErrorAction Stop) } catch { }
+        [ordered]@{
+            app = 'TapForge'; version = $script:appVersion; created = (Get-Date).ToString('o')
+            windows = [Environment]::OSVersion.Version.ToString(); powershell = $PSVersionTable.PSVersion.ToString()
+            clr = [Environment]::Version.ToString(); clickEngine = 'Native high-resolution worker (waitable timer)'
+            usage = $script:usage; log = $logTail
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $dlg.FileName -Encoding UTF8
+        Set-UpdateStatus ('Report saved to ' + $dlg.FileName)
+    }
+})
+$ui.resetUsage.Add_Click({
+    if ((Show-TFDialog 'Reset usage data?' 'Clear all click statistics? This cannot be undone.' @('Cancel', 'Reset')) -ne 1) { return }
+    $script:usage = @{ clicks = 0L; sessions = 0; seconds = 0.0; last = '' }; Save-Usage; Update-UsageUi
+})
+
+$script:updateRequest = $null; $script:downloadRequest = $null
+$script:updateTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$script:updateTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+function Start-UpdateCheck([bool]$automatic) {
+    if ($script:updateRequest -or $script:downloadRequest) { return }
+    $script:updateAutomatic = $automatic
+    Set-UpdateStatus "Checking for updates$($script:ell)"
+    $script:updateRequest = [TapForgeRequest]::GetText('https://api.github.com/repos/saberapexyt-commits/TapForge/releases/latest')
+    $script:updateTimer.Start()
+}
+function Install-TapForgeRelease($release) {
+    $tag = [string]$release.tag_name
+    $updates = Join-Path $script:dataDir 'Updates'; [void](New-Item -ItemType Directory -Force -Path $updates)
+    # New releases ship a single TapForge.exe. Older releases only have the portable ZIP.
+    $exeAsset = @($release.assets | Where-Object { $_.name -eq 'TapForge.exe' } | Select-Object -First 1)[0]
+    if ($exeAsset) {
+        $script:pendingUpdate = @{ Mode = 'exe'; Tag = $tag; Asset = $exeAsset; File = (Join-Path $updates "TapForge-$tag.exe") }
+    } else {
+        $zipName = "TapForge-$tag-Portable.zip"
+        $zipAsset = @($release.assets | Where-Object { $_.name -eq $zipName } | Select-Object -First 1)[0]
+        if (-not $zipAsset) { [void](Show-TFDialog 'Update' "The $tag release doesn't include a download yet. Try again in a minute."); return }
+        $script:pendingUpdate = @{ Mode = 'zip'; Tag = $tag; Asset = $zipAsset; File = (Join-Path $updates $zipName); Stage = (Join-Path $updates ([guid]::NewGuid().ToString('N'))) }
+    }
+    Set-UpdateStatus "Downloading $tag$($script:ell)"
+    $script:downloadRequest = [TapForgeRequest]::Download([string]$script:pendingUpdate.Asset.browser_download_url, $script:pendingUpdate.File)
+    $script:updateTimer.Start()
+}
+function Start-UpdateHelper([string]$helperScript, [string]$argLine) {
+    $helper = Join-Path $script:dataDir 'Updates\Apply-TapForgeUpdate.ps1'
+    $helperScript | Set-Content -LiteralPath $helper -Encoding UTF8
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$helper`" " + $argLine) -WindowStyle Hidden
+    $script:exitRequested = $true; $window.Close()
+}
+function Complete-TapForgeInstall {
+    $u = $script:pendingUpdate; $target = $script:exeDir
+    try {
+        if ($u.Asset.digest -and ([string]$u.Asset.digest -match '^sha256:([0-9a-fA-F]{64})$')) {
+            $expected = $Matches[1]; $actual = (Get-FileHash -LiteralPath $u.File -Algorithm SHA256).Hash
+            if ($actual -ne $expected) { throw 'The downloaded update did not pass its SHA-256 check.' }
+        }
+        $probe = Join-Path $target '.tapforge-update-check'; Set-Content -LiteralPath $probe -Value 'ok' -Encoding ascii; Remove-Item -LiteralPath $probe -Force
+        if ($u.Mode -eq 'exe') {
+            $bytes = [System.IO.File]::ReadAllBytes($u.File)
+            if ($bytes.Length -lt 20000 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw 'The downloaded file is not a valid TapForge.exe.' }
+            Start-UpdateHelper @'
+param([string]$NewExe,[string]$TargetExe,[int]$WaitPid)
+for($i=0;$i -lt 120;$i++){if(!(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}
+$ok=$false
+for($i=0;$i -lt 40 -and -not $ok;$i++){try{Copy-Item -LiteralPath $NewExe -Destination $TargetExe -Force -ErrorAction Stop;$ok=$true}catch{Start-Sleep -Milliseconds 500}}
+Start-Process -FilePath $TargetExe -WorkingDirectory (Split-Path -Parent $TargetExe)
+'@ ("-NewExe `"$($u.File)`" -TargetExe `"$($script:exePath)`" -WaitPid $PID")
+        } else {
+            [void](New-Item -ItemType Directory -Force -Path $u.Stage)
+            Expand-Archive -LiteralPath $u.File -DestinationPath $u.Stage -Force
+            if (-not (Test-Path -LiteralPath (Join-Path $u.Stage 'TapForge.exe'))) { throw 'The update package is missing TapForge.exe.' }
+            Start-UpdateHelper @'
+param([string]$TargetDir,[string]$StageDir,[int]$WaitPid)
+for($i=0;$i -lt 120;$i++){if(!(Get-Process -Id $WaitPid -ErrorAction SilentlyContinue)){break};Start-Sleep -Milliseconds 500}
+foreach($name in @('TapForge.exe','AutoClicker.ps1','TapForge.ico','TapForgeLogo.png','VERSION','README.txt','Launch AutoClicker.bat')){$from=Join-Path $StageDir $name;if(Test-Path -LiteralPath $from){for($i=0;$i -lt 20;$i++){try{Copy-Item -LiteralPath $from -Destination (Join-Path $TargetDir $name) -Force -ErrorAction Stop;break}catch{Start-Sleep -Milliseconds 500}}}}
+Start-Process -FilePath (Join-Path $TargetDir 'TapForge.exe') -WorkingDirectory $TargetDir
+'@ ("-TargetDir `"$target`" -StageDir `"$($u.Stage)`" -WaitPid $PID")
+        }
+    } catch {
+        Set-UpdateStatus 'Update failed.'
+        [void](Show-TFDialog 'Update failed' ("TapForge could not install the update.`n`n" + $_.Exception.Message))
+        if ($u.Stage -and (Test-Path -LiteralPath $u.Stage)) { Remove-Item -LiteralPath $u.Stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+$script:updateTimer.Add_Tick({
+    if ($script:downloadRequest) {
+        $r = $script:downloadRequest
+        if (-not $r.Done) {
+            if ($r.Total -gt 0) { Set-UpdateStatus ('Downloading {0}{1} {2:N0}%' -f $script:pendingUpdate.Tag, $script:ell, (100.0 * $r.Received / $r.Total)) }
+            return
+        }
+        $script:updateTimer.Stop(); $script:downloadRequest = $null
+        if ($r.Error) { Set-UpdateStatus 'Download failed.'; [void](Show-TFDialog 'Update failed' ("Could not download the update.`n`n" + $r.Error)); return }
+        Complete-TapForgeInstall
+        return
+    }
+    $r = $script:updateRequest
+    if (-not $r -or -not $r.Done) { return }
+    $script:updateTimer.Stop(); $script:updateRequest = $null
+    if ($r.Error) {
+        Set-UpdateStatus 'Could not check for updates.'
+        if (-not $script:updateAutomatic) { [void](Show-TFDialog 'Update check' ("Could not check for updates.`n`n" + $r.Error)) }
+        return
+    }
+    try { $release = ConvertFrom-Json -InputObject $r.Text } catch { Set-UpdateStatus 'Could not read the update information.'; return }
+    $available = try { ([version]([string]$release.tag_name -replace '^v', '')) -gt ([version]$script:appVersion) } catch { $false }
+    if (-not $available) {
+        Set-UpdateStatus "You're up to date (v$($script:appVersion))."
+        if (-not $script:updateAutomatic) { [void](Show-TFDialog 'Up to date' "TapForge v$($script:appVersion) is the latest version.") }
+        return
+    }
+    Set-UpdateStatus "Update available: $($release.tag_name)"
+    $notes = ([string]$release.body).Trim()
+    if ($notes.Length -gt 700) { $notes = $notes.Substring(0, 700) + $script:ell }
+    $whatsNew = if ($notes) { "`n`nWhat's new:`n$notes" } else { '' }
+    if ((Show-TFDialog 'Update available' "TapForge $($release.tag_name) is available.$whatsNew`n`nInstall it now? TapForge will close and reopen." @('Not now', 'Install')) -eq 1) { Install-TapForgeRelease $release }
+})
+$ui.checkUpdateButton.Add_Click({ Start-UpdateCheck $false })
+$ui.maintCheckButton.Add_Click({ Start-UpdateCheck $false })
+$ui.publishUpdateButton.Add_Click({
+    Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$($script:publisherPath)`"" -WorkingDirectory $script:exeDir -WindowStyle Hidden
+})
+
+# ===== Tray ================================================================
+$script:exitRequested = $false
+$script:trayIcon = [System.Windows.Forms.NotifyIcon]::new()
+$script:trayIcon.Text = 'TapForge'
+if ($script:trayIconImage) { $script:trayIcon.Icon = $script:trayIconImage }
+elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'TapForge.ico')) { $script:trayIcon.Icon = [System.Drawing.Icon]::new((Join-Path $PSScriptRoot 'TapForge.ico')) }
+$trayMenu = [System.Windows.Forms.ContextMenuStrip]::new()
+$trayOpen = $trayMenu.Items.Add('Open TapForge')
+$trayToggle = $trayMenu.Items.Add('Start / stop clicking')
+[void]$trayMenu.Items.Add('-')
+$trayExit = $trayMenu.Items.Add('Exit')
+$script:trayIcon.ContextMenuStrip = $trayMenu
+$script:RestoreFromTray = {
+    $window.Show()
+    if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) { $window.WindowState = [System.Windows.WindowState]::Normal }
+    [void]$window.Activate()
+    $script:trayIcon.Visible = $false
+}
+$trayOpen.Add_Click({ & $script:RestoreFromTray })
+$trayToggle.Add_Click({ Switch-Clicking })
+$trayExit.Add_Click({ $script:exitRequested = $true; $window.Close() })
+$script:trayIcon.Add_DoubleClick({ & $script:RestoreFromTray })
+$script:trayIcon.Add_BalloonTipClosed({ if ($script:hideTrayAfterTip -and $window.IsVisible) { $script:trayIcon.Visible = $false }; $script:hideTrayAfterTip = $false })
+
+# ===== Settings ============================================================
+function Save-UserSettings {
+    try {
+        $accents = @{}; foreach ($k in $script:pageAccents.Keys) { $accents[$k] = $script:pageAccents[$k] }
+        $saved = [ordered]@{
+            intervalMs = (Get-IntervalMilliseconds); intervalMsExact = $script:intervalMs; intervalUnit = $ui.intervalUnit.SelectedIndex
+            button = $ui.buttonPick.SelectedIndex; stopMode = $ui.modePick.SelectedIndex; limit = [long]$limit.Value
+            speedMode = $ui.speedMode.SelectedIndex; rate = [double]$rate.Value; extendedSpeed = (Is-On $ui.extendedSpeed)
+            startKey = [string]$ui.keyPick.SelectedItem; emergencyKey = [string]$ui.emergencyKey.SelectedItem; hotkeyMode = $ui.hotkeyMode.SelectedIndex
+            keyboardMode = (Is-On $ui.keyboardMode); keyCode = $ui.keyCodePick.SelectedIndex; doubleClick = ($ui.clickTypePick.SelectedIndex -eq 1)
+            duty = [int]$duty.Value; randomize = [int]$randomize.Value
+            cornerStop = (Is-On $ui.cornerStop); cornerSize = [int]$cornerSize.Value; edgeStop = (Is-On $ui.edgeStop); edgeSize = [int]$edgeSize.Value
+            alwaysTop = (Is-On $ui.alwaysTop); stopAlert = (Is-On $ui.stopAlert); strictHotkey = (Is-On $ui.strictHotkey); stopAltTab = (Is-On $ui.stopAltTab)
+            minimizeTray = (Is-On $ui.minimizeTray); rememberPosition = (Is-On $ui.rememberPosition); runOnStartup = (Is-On $ui.runOnStartup)
+            pointDefaultClicks = [int]$pointClicks.Value; pointDefaultRadius = [int]$pointRadius.Value
+            pointsEnabled = (Is-On $ui.pointsEnabled); stopWhenPointsDone = (Is-On $ui.stopWhenPointsDone)
+            points = @($script:points | ForEach-Object { @{ x = $_.X; y = $_.Y } })
+            filterProcess = (Is-On $ui.filterProcess); processTitle = $script:selectedProcessTitle
+            theme = $ui.themePick.SelectedIndex; appearanceMode = $ui.appearanceModePick.SelectedIndex; globalAccent = $script:globalAccent; pageAccents = $accents
+            activeIcon = (Is-On $ui.activeIcon); iconTheme = $ui.iconTheme.SelectedIndex; iconColor = $ui.iconColor.SelectedIndex
+            footer = (Is-On $ui.footerToggle); page = $script:currentPage; compact = $script:compactMode; activePreset = $script:activePreset
+        }
+        $tmp = $script:settingsFile + '.tmp'
+        $saved | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $script:settingsFile -Force
+    } catch { Write-TFLog ('Save settings failed: ' + $_.Exception.Message) }
+}
+function Restore-UserSettings {
+    if (-not (Test-Path -LiteralPath $script:settingsFile)) { return }
+    $script:restoring = $true
+    try {
+        $d = Get-Content -LiteralPath $script:settingsFile -Raw | ConvertFrom-Json
+        if (Has-Prop $d 'extendedSpeed') { $ui.extendedSpeed.IsChecked = [bool]$d.extendedSpeed }
+        Update-RateLimit
+        Set-IntervalFromData $d
+        if (Has-Prop $d 'button') { Set-Index $ui.buttonPick $d.button }
+        if (Has-Prop $d 'stopMode') { Set-Index $ui.modePick $d.stopMode }
+        if (Has-Prop $d 'limit') { $limit.Value = [double]$d.limit }
+        if (Has-Prop $d 'speedMode') { Set-Index $ui.speedMode $d.speedMode }
+        if (Has-Prop $d 'rate') { $rate.Value = [double]$d.rate }
+        if (Has-Prop $d 'hotkeyMode') { Set-Index $ui.hotkeyMode $d.hotkeyMode }
+        $sk = [string]$d.startKey; $ek = [string]$d.emergencyKey
+        if ($ek -and $ui.emergencyKey.Items.Contains($ek) -and $ek -ne [string]$ui.keyPick.SelectedItem) { $ui.emergencyKey.SelectedItem = $ek }
+        if ($sk -and $ui.keyPick.Items.Contains($sk) -and $sk -ne [string]$ui.emergencyKey.SelectedItem) { $ui.keyPick.SelectedItem = $sk }
+        if ($ek -and $ui.emergencyKey.Items.Contains($ek) -and $ek -ne [string]$ui.keyPick.SelectedItem) { $ui.emergencyKey.SelectedItem = $ek }
+        if (Has-Prop $d 'keyboardMode') { $ui.keyboardMode.IsChecked = [bool]$d.keyboardMode }
+        if (Has-Prop $d 'keyCode') { Set-Index $ui.keyCodePick $d.keyCode }
+        if (Has-Prop $d 'doubleClick') { $ui.clickTypePick.SelectedIndex = if ([bool]$d.doubleClick) { 1 } else { 0 } }
+        if (Has-Prop $d 'duty') { $duty.Value = [double]$d.duty }
+        if (Has-Prop $d 'randomize') { $randomize.Value = [double]$d.randomize }
+        if (Has-Prop $d 'cornerStop') { $ui.cornerStop.IsChecked = [bool]$d.cornerStop }
+        if (Has-Prop $d 'cornerSize') { $cornerSize.Value = [double]$d.cornerSize }
+        if (Has-Prop $d 'edgeStop') { $ui.edgeStop.IsChecked = [bool]$d.edgeStop }
+        if (Has-Prop $d 'edgeSize') { $edgeSize.Value = [double]$d.edgeSize }
+        foreach ($n in @('alwaysTop', 'stopAlert', 'strictHotkey', 'stopAltTab', 'minimizeTray', 'rememberPosition', 'runOnStartup', 'pointsEnabled', 'stopWhenPointsDone', 'filterProcess', 'activeIcon')) {
+            if (Has-Prop $d $n) { $ui[$n].IsChecked = [bool]$d.$n }
+        }
+        if (Has-Prop $d 'footer') { $ui.footerToggle.IsChecked = [bool]$d.footer }
+        if (Has-Prop $d 'pointDefaultClicks') { $pointClicks.Value = [double]$d.pointDefaultClicks }
+        if (Has-Prop $d 'pointDefaultRadius') { $pointRadius.Value = [double]$d.pointDefaultRadius }
+        $script:points.Clear()
+        if (Has-Prop $d 'points') { foreach ($p in @($d.points)) { if ($null -ne $p) { [void]$script:points.Add([System.Drawing.Point]::new([int]$p.x, [int]$p.y)) } } }
+        if (Has-Prop $d 'processTitle') { $script:selectedProcessTitle = [string]$d.processTitle; if ($script:selectedProcessTitle) { $ui.processSelectedLabel.Text = 'Selected: ' + $script:selectedProcessTitle } }
+        if (Has-Prop $d 'theme') { Set-Index $ui.themePick $d.theme }
+        if (Has-Prop $d 'appearanceMode') { Set-Index $ui.appearanceModePick $d.appearanceMode }
+        if ((Has-Prop $d 'globalAccent') -and (Test-Hex ([string]$d.globalAccent))) { $script:globalAccent = ([string]$d.globalAccent).ToUpper() }
+        foreach ($k in @($script:pageAccents.Keys)) { $script:pageAccents[$k] = $script:globalAccent }
+        if (Has-Prop $d 'pageAccents') {
+            foreach ($prop in $d.pageAccents.PSObject.Properties) {
+                $hex = [string]$prop.Value; if (-not (Test-Hex $hex)) { continue }
+                if ($script:pageAccents.ContainsKey($prop.Name)) { $script:pageAccents[$prop.Name] = $hex.ToUpper() }
+                if ($prop.Name -eq 'Behavior') { $script:pageAccents['More control'] = $hex.ToUpper() }
+            }
+        }
+        if (Has-Prop $d 'iconTheme') { Set-Index $ui.iconTheme $d.iconTheme }
+        if (Has-Prop $d 'iconColor') { Set-Index $ui.iconColor $d.iconColor }
+        if ((Has-Prop $d 'activePreset') -and $d.activePreset) { $script:activePreset = [string]$d.activePreset }
+        if (Has-Prop $d 'page') {
+            $legacy = @{ 'Click Points' = 'Points'; 'Process List' = 'Process' }
+            $pg = [string]$d.page; if ($legacy.ContainsKey($pg)) { $pg = $legacy[$pg] }
+            if ($script:pageMap.Contains($pg)) { $script:currentPage = $pg }
+        }
+        $script:restoreCompact = [bool]$d.compact
+    } catch { Write-TFLog ('Restore settings failed: ' + $_.Exception.Message) }
+    finally { $script:restoring = $false }
+}
+$ui.resetSettings.Add_Click({
+    if ((Show-TFDialog 'Reset all settings?' 'Return every TapForge option to its default? Your presets and usage data are kept.' @('Cancel', 'Reset')) -ne 1) { return }
+    $script:restoring = $true
+    try {
+        $ui.themePick.SelectedIndex = 0; $ui.appearanceModePick.SelectedIndex = 0
+        $script:globalAccent = '#7B61FF'; foreach ($k in @($script:pageAccents.Keys)) { $script:pageAccents[$k] = '#7B61FF' }
+        $ui.extendedSpeed.IsChecked = $false; Update-RateLimit
+        $ui.intervalUnit.SelectedIndex = 0; $script:intervalMs = 100.0; Show-IntervalInUnit
+        $ui.buttonPick.SelectedIndex = 0; $ui.clickTypePick.SelectedIndex = 0; $ui.modePick.SelectedIndex = 0; $limit.Value = 100
+        $ui.speedMode.SelectedIndex = 0; $rate.Value = 10; $ui.hotkeyMode.SelectedIndex = 0
+        $ui.emergencyKey.SelectedItem = 'F7'; $ui.keyPick.SelectedItem = 'F6'
+        $ui.keyboardMode.IsChecked = $false; $ui.keyCodePick.SelectedIndex = 0
+        $duty.Value = 0; $randomize.Value = 0; $cornerSize.Value = 50; $edgeSize.Value = 40
+        $ui.cornerStop.IsChecked = $false; $ui.edgeStop.IsChecked = $false
+        $ui.alwaysTop.IsChecked = $false; $ui.stopAlert.IsChecked = $true; $ui.strictHotkey.IsChecked = $false; $ui.stopAltTab.IsChecked = $false
+        $ui.minimizeTray.IsChecked = $false; $ui.rememberPosition.IsChecked = $true
+        $pointClicks.Value = 1; $pointRadius.Value = 0; $ui.pointsEnabled.IsChecked = $false; $ui.stopWhenPointsDone.IsChecked = $false
+        $script:points.Clear(); Update-PointList
+        $ui.filterProcess.IsChecked = $false
+        $ui.activeIcon.IsChecked = $true; $ui.iconTheme.SelectedIndex = 0; $ui.iconColor.SelectedIndex = 0; $ui.footerToggle.IsChecked = $true
+        $script:activePreset = $null; Update-Footer
+    } finally { $script:restoring = $false }
+    $ui.runOnStartup.IsChecked = $false
+    Apply-Theme; Apply-Accent -Force; Update-SpeedUi; Update-ModeUi; Update-HotkeyCaption
+    Save-UserSettings
+})
+
+# ===== Startup =============================================================
+Restore-UserSettings
+Apply-Theme
+Show-IntervalInUnit
+Update-SpeedUi; Update-ModeUi; Update-HotkeyCaption; Update-PointList; Update-PresetList; Update-Footer; Update-UsageUi
+$ui.footer.Visibility = if (Is-On $ui.footerToggle) { 'Visible' } else { 'Collapsed' }
+$window.Topmost = Is-On $ui.alwaysTop
+if (Is-On $ui.alwaysTop) { $ui.pinButton.Content = [string][char]0xE840; Set-NavActive 'pinButton' $true }
+$script:prevStartKey = [string]$ui.keyPick.SelectedItem; $script:prevEmergencyKey = [string]$ui.emergencyKey.SelectedItem
+$startPage = $script:currentPage; $script:currentPage = ''
+Show-Page $startPage
+Apply-Accent -Force
+
+if ((Is-On $ui.rememberPosition) -and (Test-Path -LiteralPath $script:windowStateFile)) {
+    try {
+        $w = Get-Content -LiteralPath $script:windowStateFile -Raw | ConvertFrom-Json
+        $vsLeft = [System.Windows.SystemParameters]::VirtualScreenLeft; $vsTop = [System.Windows.SystemParameters]::VirtualScreenTop
+        $vsRight = $vsLeft + [System.Windows.SystemParameters]::VirtualScreenWidth; $vsBottom = $vsTop + [System.Windows.SystemParameters]::VirtualScreenHeight
+        $x = [double]$w.x; $y = [double]$w.y
+        if ($x -ge $vsLeft - 50 -and $y -ge $vsTop - 10 -and $x -lt $vsRight - 100 -and $y -lt $vsBottom - 60) {
+            $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+            $window.Left = $x; $window.Top = $y
+            if ((Has-Prop $w 'w') -and [double]$w.w -ge 800) { $window.Width = [double]$w.w }
+            if ((Has-Prop $w 'h') -and [double]$w.h -ge 580) { $window.Height = [double]$w.h }
+        }
+    } catch { }
+}
+
+$window.Add_Closing({
+    param($s, $e)
+    if ((Is-On $ui.minimizeTray) -and -not $script:exitRequested) {
+        $e.Cancel = $true; $window.Hide(); $script:trayIcon.Visible = $true
+        return
+    }
+    if (Is-On $ui.rememberPosition) {
+        try {
+            $size = if ($script:compactMode) { $script:normalSize } else { @($window.RestoreBounds.Width, $window.RestoreBounds.Height) }
+            $left = if ($window.WindowState -eq [System.Windows.WindowState]::Normal) { $window.Left } else { $window.RestoreBounds.Left }
+            $top = if ($window.WindowState -eq [System.Windows.WindowState]::Normal) { $window.Top } else { $window.RestoreBounds.Top }
+            @{ x = $left; y = $top; w = $size[0]; h = $size[1] } | ConvertTo-Json | Set-Content -LiteralPath $script:windowStateFile -Encoding UTF8
+        } catch { }
+    }
+    Save-UserSettings
+    if ($script:running) { Stop-Clicking }
+    [ClickNative]::Stop()
+    $script:hotkeyTimer.Stop(); $script:monitorTimer.Stop(); $script:updateTimer.Stop()
+    $script:trayIcon.Visible = $false; $script:trayIcon.Dispose()
+})
+$window.Add_ContentRendered({
+    if ($script:restoreCompact) { $script:restoreCompact = $false; Set-Compact $true }
+    $script:startupCheck = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:startupCheck.Interval = [TimeSpan]::FromSeconds(2)
+    $script:startupCheck.Add_Tick({ $script:startupCheck.Stop(); Start-UpdateCheck $true })
+    $script:startupCheck.Start()
+})
+
+$script:hotkeyTimer.Start()
+$global:TapForgeReady = $true
+# Run as a normal (non-modal) app window. ShowDialog would end as soon as the
+# window is hidden (tray, point picker) and leave a frozen window behind.
+$script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+$window.Add_Closed({ $script:app.Shutdown() })
+[void]$script:app.Run($window)
+
+} catch {
+    $line = if ($_.InvocationInfo) { $_.InvocationInfo.ScriptLineNumber } else { 0 }
+    $msg = "TapForge could not start.`r`n`r`n$($_.Exception.Message)`r`n`r`n(line $line)"
+    Write-TFLog ($msg + "`r`n" + $_.ScriptStackTrace)
+    [System.Windows.Forms.MessageBox]::Show($msg, 'TapForge', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+}

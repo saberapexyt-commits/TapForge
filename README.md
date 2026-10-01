@@ -1,25 +1,25 @@
 # TapForge
 
-TapForge is a portable Windows autoclicker. Download the latest portable ZIP
-from [GitHub Releases](https://github.com/saberapexyt-commits/TapForge/releases).
+TapForge is a Windows autoclicker.
+
+**[Download TapForge.exe](https://github.com/saberapexyt-commits/TapForge/releases/latest/download/TapForge.exe)**: one file, no install. It updates itself.
 
 ## Features
 
-- Configurable mouse or keyboard clicks and intervals in milliseconds, seconds,
-  or minutes
-- Start/stop and emergency hotkeys
-- Optional click points, click limits, speed randomization, and screen safety
-- Local settings persistence and tray support
+- Mouse or keyboard clicks, interval (ms/sec/min) or clicks per second
+- High-resolution click engine, global hotkeys (including Mouse 4/5), hold or toggle
+- Click points, process filter, screen safety stops, presets, tray and compact modes
+- Light/dark theme with custom accent colors
 
-## Build
+## Developing
 
-Run `Build TapForge.ps1` in Windows PowerShell. The distributable consists of
-`TapForge.exe`, `AutoClicker.ps1`, `TapForge.ico`, `TapForgeLogo.png`,
-`Launch AutoClicker.bat`, and `README.txt`.
+- `AutoClicker.ps1` is the app (WPF interface + click engine). `TapForge.exe` in this
+  folder runs it directly because of the `TapForge.dev` marker file.
+- `Build TapForge.ps1` builds the single-file `TapForge.exe` (script, logo, icon and
+  `VERSION` are embedded).
 
-## Releases
+## Publishing
 
-After committing source changes, run
-`Publish-TapForgeUpdate.ps1 -Version MAJOR.MINOR.PATCH`. The script pushes the
-source and release tag; GitHub Actions builds the Windows app and attaches the
-portable ZIP to the release.
+Double-click **Publish TapForge.bat**, type what's new and click **Publish to everyone**.
+It test-builds, commits, pushes and tags; GitHub Actions then builds `TapForge.exe` and
+attaches it (plus a legacy portable ZIP for older versions) to a new release.
